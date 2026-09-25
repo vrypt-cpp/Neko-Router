@@ -10,7 +10,7 @@ import {
   filterSelfReferencingUpstreams,
 } from "./router";
 import { recordTelemetry, registerActiveRequest } from "./telemetry";
-import { incrementClientKeyTokens, checkClientRateLimit, validateClientKey } from "./auth";
+import { incrementClientKeyTokens, checkClientRateLimit } from "./auth";
 import { db } from "../db";
 import { upstreamKeys, type ClientKey, type UpstreamKey } from "../db/schema";
 import { eq, or, like, and } from "drizzle-orm";
