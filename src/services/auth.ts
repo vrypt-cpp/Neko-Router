@@ -2,15 +2,35 @@ import { sqlite, db } from "../db";
 import { clientKeys, apiKeys, upstreamKeys, type ClientKey, type ApiKey } from "../db/schema";
 import { eq, and, or } from "drizzle-orm";
 
+/**
+ * Returns the JWT signing secret.
+ *
+ * Fail-closed by design: if no secret has been bootstrapped we throw instead of
+ * falling back to a hardcoded value. A predictable signing secret would let anyone
+ * forge an admin session token, so a missing secret must never degrade silently.
+ *
+ * The secret is bootstrapped synchronously in src/db/index.ts (see ensureJwtSecretSync),
+ * which is guaranteed to run before any route module reads this value.
+ */
 export function getJwtSecret(): string {
+  let row: { value: string } | null = null;
   try {
-    const row = sqlite
+    row = sqlite
       .query("SELECT value FROM settings WHERE key = 'jwt_secret'")
       .get() as { value: string } | null;
-    return row?.value || process.env.JWT_SECRET || "neko-router-default-secret-key-32";
   } catch (e) {
-    return process.env.JWT_SECRET || "neko-router-default-secret-key-32";
+    throw new Error(
+      "Unable to read the JWT secret from the database. Refusing to start with an insecure fallback."
+    );
   }
+
+  if (!row?.value) {
+    throw new Error(
+      "JWT secret is not initialized. Refusing to sign or verify tokens with a predictable secret."
+    );
+  }
+
+  return row.value;
 }
 
 export function isDefaultPin(): boolean {

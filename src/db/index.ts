@@ -151,13 +151,49 @@ export function initTablesSync(): void {
   } catch (e) {}
 }
 
+/**
+ * Ensures the settings table exists and a JWT secret is present BEFORE any
+ * route module is evaluated.
+ *
+ * This MUST run at module load time (not inside initDatabase()): the @elysiajs/jwt
+ * plugin captures its secret when it is constructed during route module evaluation,
+ * which happens before the top-level `await initDatabase()` in src/index.ts.
+ * Bootstrapping here guarantees the plugin never falls back to a hardcoded secret.
+ */
+export function ensureJwtSecretSync(): void {
+  initTablesSync();
+
+  const existing = sqlite
+    .query("SELECT value FROM settings WHERE key = 'jwt_secret'")
+    .get() as { value: string } | null;
+  if (existing?.value) return;
+
+  const secret = process.env.JWT_SECRET?.trim() || randomSecretHex();
+  sqlite.run(
+    "INSERT INTO settings (key, value, updated_at) VALUES ('jwt_secret', ?, ?) ON CONFLICT(key) DO NOTHING",
+    [secret, Date.now()]
+  );
+}
+
+function randomSecretHex(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(32)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 // Run table bootstrap synchronously immediately
 initTablesSync();
+
+// Bootstrap the JWT secret synchronously so route modules that read it during
+// evaluation always get a real, per-deployment secret.
+ensureJwtSecretSync();
 
 export let db = drizzle(sqlite, { schema });
 
 export async function initDatabase(): Promise<void> {
+  // Tables + JWT secret are bootstrapped synchronously at module load.
   initTablesSync();
+  ensureJwtSecretSync();
 
   // Check default PIN setup
   const pinRow = sqlite
@@ -179,23 +215,6 @@ export async function initDatabase(): Promise<void> {
       [now]
     );
     console.log("Initialized default PIN (123456) with is_default_pin=1");
-  }
-
-  // Check JWT secret
-  const jwtRow = sqlite
-    .query("SELECT value FROM settings WHERE key = 'jwt_secret'")
-    .get() as { value: string } | null;
-
-  if (!jwtRow) {
-    const randomSecret =
-      process.env.JWT_SECRET ||
-      Array.from(crypto.getRandomValues(new Uint8Array(32)))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('jwt_secret', ?, ?)",
-      [randomSecret, Date.now()]
-    );
   }
 }
 
