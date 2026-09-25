@@ -477,7 +477,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       }),
     }
   )
-  .get("/", async () => {
+  .get("/", async ({ isAdmin }) => {
     const list = db
       .select()
       .from(upstreamKeys)
@@ -509,6 +509,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
 
         const enabledCount = models.filter((m) => m.enabled).length;
 
+        // Plaintext provider secrets are served to admin sessions only (the
+        // dashboard key-management modal pre-fills its edit form from them).
+        // Callers authenticated with a long-lived nr-api- bearer key receive
+        // metadata and masked representations: enough to manage, rotate, and
+        // test keys, but not to harvest every stored provider secret in bulk.
+        const revealSecrets = Boolean(isAdmin);
+
         return {
           id: item.id,
           provider: item.provider as "openai" | "anthropic",
@@ -520,8 +527,8 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
           weight: item.weight,
           createdAt: item.createdAt,
           updatedAt: item.updatedAt,
-          apiKey: isFollow ? "" : (activeEntries[0]?.key || entries[0]?.key || item.apiKey || ""),
-          apiKeys: entries.map((e) => e.key),
+          apiKey: revealSecrets && !isFollow ? (activeEntries[0]?.key || entries[0]?.key || item.apiKey || "") : "",
+          apiKeys: revealSecrets ? entries.map((e) => e.key) : [],
           keyEntries: entries.map((e) => ({
             id: e.id,
             name: e.name,
@@ -543,7 +550,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
 
     return { upstreams };
   })
-  .get("/:id", ({ params: { id }, set }) => {
+  .get("/:id", ({ params: { id }, set, isAdmin }) => {
     const item = db
       .select()
       .from(upstreamKeys)
@@ -560,6 +567,10 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
     const activeEntries = entries.filter((e) => e.isActive);
     const models = parseUpstreamModels(item.models);
 
+    // Same secrecy rule as the list endpoint above: plaintext (including
+    // per-entry refresh tokens) only for admin sessions.
+    const revealSecrets = Boolean(isAdmin);
+
     return {
       upstream: {
         id: item.id,
@@ -573,9 +584,17 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         followUpstream: isFollow,
         createdAt: item.createdAt,
         updatedAt: item.updatedAt,
-        apiKey: isFollow ? "" : (activeEntries[0]?.key || entries[0]?.key || item.apiKey || ""),
-        apiKeys: entries.map((e) => e.key),
-        keyEntries: entries,
+        apiKey: revealSecrets && !isFollow ? (activeEntries[0]?.key || entries[0]?.key || item.apiKey || "") : "",
+        apiKeys: revealSecrets ? entries.map((e) => e.key) : [],
+        keyEntries: revealSecrets
+          ? entries
+          : entries.map((e) => ({
+              id: e.id,
+              name: e.name,
+              maskedKey: maskKey(e.key),
+              isActive: e.isActive,
+              createdAt: e.createdAt,
+            })),
         totalKeysCount: entries.length,
         activeKeysCount: activeEntries.length,
         models,

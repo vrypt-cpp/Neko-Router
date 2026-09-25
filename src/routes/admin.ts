@@ -64,7 +64,17 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
       dbPath: DB_PATH,
     };
   })
-  .get("/db/export", () => {
+  .get("/db/export", ({ isAdmin, set }) => {
+    // Full database dumps contain every stored secret at once (upstream
+    // provider keys, client keys, the PIN hash, and the JWT signing secret).
+    // Long-lived nr-api- bearer keys must not be able to exfiltrate them in
+    // a single request: export requires the higher-assurance admin session
+    // (PIN-derived cookie or admin JWT bearer).
+    if (!isAdmin) {
+      set.status = 403;
+      return { error: "Database export requires an admin session" };
+    }
+
     // 1. Truncate WAL to write all transactions into the main .db file
     checkpointWal();
 
@@ -81,7 +91,15 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
   })
   .post(
     "/db/import",
-    async ({ body, set }) => {
+    async ({ body, set, isAdmin }) => {
+      // Rewriting the whole database (including the PIN hash and JWT secret)
+      // is equivalent to a full account takeover primitive. Same rationale as
+      // /db/export above: admin session only.
+      if (!isAdmin) {
+        set.status = 403;
+        return { success: false, error: "Database import requires an admin session" };
+      }
+
       const file = body?.file as Blob | null;
       if (!file) {
         set.status = 400;
