@@ -404,12 +404,24 @@ const performOpenAIFetch = async (
       const isFollowUpstream = Boolean((upstream as any).followUpstream);
       let authHeaderVal = `Bearer ${currentUpstreamKey}`;
       if (isFollowUpstream) {
-        // In Follow Upstream mode, forward client's valid BB key if passed, or fallback to BB default key
+        // In Follow Upstream mode, forward the client's BYOK credential — but
+        // ONLY when it is the authenticated client key. The raw header value
+        // must equal clientKey.key; anything else was not authenticated and
+        // must never be relayed to a third party. Gateway-issued sk-neko-
+        // keys must never leave this server either, so they fall back to the
+        // public default instead of being forwarded upstream.
         const clientAuth = reqHeaders.get("Authorization");
         const clientKeyHeader = reqHeaders.get("x-api-key");
         const passedKey = clientAuth?.startsWith("Bearer ") ? clientAuth.slice(7).trim() : clientKeyHeader?.trim();
-        if (passedKey && !passedKey.startsWith("sk-neko-") && passedKey !== "bb-default") {
-          authHeaderVal = `Bearer ${passedKey}`;
+        const authenticatedKey = clientKey?.key;
+        if (
+          passedKey &&
+          authenticatedKey &&
+          passedKey === authenticatedKey &&
+          !authenticatedKey.startsWith("sk-neko-") &&
+          authenticatedKey !== "bb-default"
+        ) {
+          authHeaderVal = `Bearer ${authenticatedKey}`;
         } else {
           authHeaderVal = "Bearer bb-default";
         }
@@ -1532,13 +1544,24 @@ export async function proxyOpenAIModels(
     const targetBase = (followUpstream.baseUrl || "https://bandelbanget.xyz/v1").replace(/\/+$/, "");
     const targetUrl = targetBase.endsWith("/v1") ? `${targetBase}/models` : `${targetBase}/v1/models`;
 
+    // Forward the credential upstream only when it is the authenticated
+    // client key. Gateway-issued sk-neko- keys must never be sent to a third
+    // party, and a raw header value that differs from the authenticated key
+    // was not authenticated, so it must never be relayed either.
+    const authenticatedKey = clientKey?.key;
     let authToSend: string;
-    if (passedKey && passedKey !== "bb-default" && !passedKey.startsWith("sk-neko-")) {
-      authToSend = `Bearer ${passedKey}`;
+    if (
+      passedKey &&
+      authenticatedKey &&
+      passedKey === authenticatedKey &&
+      authenticatedKey !== "bb-default" &&
+      !authenticatedKey.startsWith("sk-neko-")
+    ) {
+      authToSend = `Bearer ${authenticatedKey}`;
     } else if (followUpstream.apiKey) {
       authToSend = `Bearer ${followUpstream.apiKey}`;
     } else {
-      authToSend = authHeader || "Bearer bb-default";
+      authToSend = "Bearer bb-default";
     }
 
     try {
