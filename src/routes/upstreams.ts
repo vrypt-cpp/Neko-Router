@@ -2,6 +2,7 @@ import { Elysia, t } from "elysia";
 import { db } from "../db";
 import { upstreamKeys } from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
+import { fetchUpstream, validateBaseUrlInput } from "../services/ssrf";
 import { eq, desc } from "drizzle-orm";
 import {
   getBaseUrl,
@@ -217,7 +218,7 @@ async function testSingleKey(
         Authorization: `Bearer ${key}`,
       };
 
-      const res = await fetch(url, {
+      const res = await fetchUpstream(url, {
         headers,
         signal: AbortSignal.timeout(10000),
       });
@@ -234,7 +235,7 @@ async function testSingleKey(
       }
     } else {
       const url = `${effectiveBaseUrl}/v1/messages`;
-      const res = await fetch(url, {
+      const res = await fetchUpstream(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -606,6 +607,14 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
     async ({ body, set }) => {
       const { provider, name, prefix, apiKey, apiKeys, keyEntries, rawKeys, baseUrl, weight, roundRobin, models } = body;
 
+      // Reject loopback/internal targets at save time (fast feedback; the
+      // authoritative enforcement runs on every fetch via fetchUpstream).
+      const baseUrlError = validateBaseUrlInput(baseUrl);
+      if (baseUrlError) {
+        set.status = 400;
+        return { error: `Invalid baseUrl: ${baseUrlError}` };
+      }
+
       // Extract and normalize keys list
       let normalizedEntries: UpstreamKeyEntry[] = [];
       if (Array.isArray(keyEntries) && keyEntries.length > 0) {
@@ -774,7 +783,14 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       if (body.name !== undefined) updateData.name = body.name.trim();
       if (body.prefix !== undefined) updateData.prefix = body.prefix ? body.prefix.trim() : null;
       if (body.provider !== undefined) updateData.provider = body.provider;
-      if (body.baseUrl !== undefined) updateData.baseUrl = body.baseUrl?.trim() || null;
+      if (body.baseUrl !== undefined) {
+        const baseUrlError = validateBaseUrlInput(body.baseUrl);
+        if (baseUrlError) {
+          set.status = 400;
+          return { error: `Invalid baseUrl: ${baseUrlError}` };
+        }
+        updateData.baseUrl = body.baseUrl?.trim() || null;
+      }
       if (body.isActive !== undefined) updateData.isActive = body.isActive ? 1 : 0;
       if (body.roundRobin !== undefined) updateData.roundRobin = body.roundRobin ? 1 : 0;
       if (body.weight !== undefined) updateData.weight = Math.max(1, body.weight);
@@ -953,7 +969,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         try {
           const targetBase = (upstream.baseUrl || "https://bandelbanget.xyz/v1").replace(/\/+$/, "");
           const targetUrl = targetBase.endsWith("/v1") ? `${targetBase}/models` : `${targetBase}/v1/models`;
-          const res = await fetch(targetUrl, {
+          const res = await fetchUpstream(targetUrl, {
             headers: key ? { Authorization: `Bearer ${key}` } : { Accept: "application/json" },
             signal: AbortSignal.timeout(15000),
           });
@@ -1025,7 +1041,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
           }
         } else {
           const url = `${getBaseUrl(upstream)}/models`;
-          const res = await fetch(url, {
+          const res = await fetchUpstream(url, {
             headers: { Authorization: `Bearer ${key}` },
             signal: AbortSignal.timeout(12000),
           });
@@ -1046,7 +1062,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         // Anthropic provider
         const url = `${getBaseUrl(upstream)}/v1/models`;
         try {
-          const res = await fetch(url, {
+          const res = await fetchUpstream(url, {
             headers: {
               "x-api-key": key,
               "anthropic-version": "2023-06-01",
@@ -1764,8 +1780,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .post(
     "/test-key",
-    async ({ body }) => {
+    async ({ body, set }) => {
       const { provider, baseUrl, apiKey } = body;
+      const baseUrlError = validateBaseUrlInput(baseUrl);
+      if (baseUrlError) {
+        set.status = 400;
+        return { success: false, error: `Invalid baseUrl: ${baseUrlError}` };
+      }
       const res = await testSingleKey(provider, baseUrl || null, apiKey);
       return res;
     },

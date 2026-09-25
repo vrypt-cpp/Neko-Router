@@ -11,6 +11,7 @@ import {
 } from "./router";
 import { recordTelemetry, registerActiveRequest } from "./telemetry";
 import { incrementClientKeyTokens, checkClientRateLimit } from "./auth";
+import { fetchUpstream } from "./ssrf";
 import { db } from "../db";
 import { upstreamKeys, type ClientKey, type UpstreamKey } from "../db/schema";
 import { eq, or, like, and } from "drizzle-orm";
@@ -433,7 +434,8 @@ const performOpenAIFetch = async (
       };
     }
 
-  let response = await fetch(upstreamUrl, {
+  // All upstream fetches go through fetchUpstream (SSRF validation + redirect checks).
+  let response = await fetchUpstream(upstreamUrl, {
     method: "POST",
     headers: upstreamHeaders,
     body: JSON.stringify(requestPayload),
@@ -445,7 +447,7 @@ const performOpenAIFetch = async (
     try {
       const refreshedToken = await forceRefreshAntigravityToken(upstream.id, antigravityEntry);
       upstreamHeaders.Authorization = `Bearer ${refreshedToken}`;
-      response = await fetch(upstreamUrl, {
+      response = await fetchUpstream(upstreamUrl, {
         method: "POST",
         headers: upstreamHeaders,
         body: JSON.stringify(requestPayload),
@@ -464,7 +466,7 @@ const performOpenAIFetch = async (
       if (refreshed.refreshToken) codexEntry.refreshToken = refreshed.refreshToken;
       if (refreshed.expiresAt) codexEntry.expiresAt = refreshed.expiresAt;
       upstreamHeaders.Authorization = `Bearer ${refreshed.accessToken}`;
-      response = await fetch(upstreamUrl, {
+      response = await fetchUpstream(upstreamUrl, {
         method: "POST",
         headers: upstreamHeaders,
         body: JSON.stringify(requestPayload),
@@ -1110,7 +1112,7 @@ providerLoop: for (const candidate of upstreamCandidates) {
 
   for (let attempt = 0; attempt < keyCandidates.length; attempt++) {
     try {
-      const response = await fetch(upstreamUrl, {
+      const response = await fetchUpstream(upstreamUrl, {
         method: "POST",
         headers: buildAnthropicHeaders(keyCandidates[attempt]!),
         body: JSON.stringify(optimizedBody),
@@ -1565,7 +1567,7 @@ export async function proxyOpenAIModels(
     }
 
     try {
-      const upstreamRes = await fetch(targetUrl, {
+      const upstreamRes = await fetchUpstream(targetUrl, {
         method: "GET",
         headers: {
           Authorization: authToSend,
