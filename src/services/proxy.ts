@@ -231,7 +231,14 @@ if (upstreamCandidates.length === 0) {
   let cacheKey = "";
   if (opt.cacheEnabled) {
     try {
-      cacheKey = await computeCacheKey("openai", model, optimizedBody.messages);
+      cacheKey = await computeCacheKey({
+        provider: "openai",
+        model,
+        clientKeyId: clientKey?.id ?? null,
+        upstreamId: upstream.id,
+        upstreamBaseUrl: getBaseUrl(upstream),
+        body: optimizedBody,
+      });
       const cached = getCachedResponse(cacheKey);
       if (cached) {
         finishActive();
@@ -960,9 +967,13 @@ if (upstreamCandidates.length === 0) {
   let cacheKey = "";
   if (opt.cacheEnabled) {
     try {
-      cacheKey = await computeCacheKey("anthropic", model, {
-        system: optimizedBody.system,
-        messages: optimizedBody.messages,
+      cacheKey = await computeCacheKey({
+        provider: "anthropic",
+        model,
+        clientKeyId: clientKey?.id ?? null,
+        upstreamId: upstream.id,
+        upstreamBaseUrl: getBaseUrl(upstream),
+        body: optimizedBody,
       });
       const cached = getCachedResponse(cacheKey);
       if (cached) {

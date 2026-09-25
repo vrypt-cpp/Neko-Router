@@ -233,12 +233,72 @@ export function optimizeRequestBody(body: any, provider: "openai" | "anthropic")
 /**
  * Exact Response Cache Helpers
  */
-export async function computeCacheKey(
-  provider: string,
-  model: string,
-  messages: any
-): Promise<string> {
-  const payload = `${provider}:${model}:${JSON.stringify(messages)}`;
+
+/** Deterministic JSON serialization: object keys sorted recursively, so
+ *  semantically identical payloads always hash identically regardless of
+ *  property insertion order. Returns null on (unexpected) failure. */
+function stableStringify(value: any): string | null {
+  try {
+    const seen = new Set<object>();
+    const sort = (v: any): any => {
+      if (v === null || typeof v !== "object") return v;
+      if (seen.has(v)) return "[circular]";
+      seen.add(v);
+      if (Array.isArray(v)) {
+        const arr = v.map(sort);
+        seen.delete(v);
+        return arr;
+      }
+      const out: Record<string, any> = {};
+      for (const k of Object.keys(v).sort()) {
+        const val = (v as Record<string, any>)[k];
+        if (val !== undefined && typeof val !== "function") {
+          out[k] = sort(val);
+        }
+      }
+      seen.delete(v);
+      return out;
+    };
+    const result = JSON.stringify(sort(value));
+    return typeof result === "string" ? result : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export interface CacheKeyParams {
+  provider: string;
+  model: string;
+  /** Identity of the calling client key: the cache is partitioned per key so
+   *  one tenant can never be served another tenant's cached response. */
+  clientKeyId?: string | null;
+  /** Identity of the selected upstream (id + base URL): the same prompt can
+   *  legitimately produce different outputs on different providers. */
+  upstreamId?: string | null;
+  upstreamBaseUrl?: string | null;
+  /** Full generation-affecting request payload (messages plus temperature,
+   *  max_tokens, tools, thinking, response_format, stream flag, ...).
+   *  Passing the whole body instead of cherry-picked fields guarantees a
+   *  newly introduced parameter can never collide with an older entry. */
+  body?: any;
+}
+
+/**
+ * Computes the response-cache key. Every dimension that can change the
+ * upstream's output — caller identity, selected upstream, model, and the
+ * complete request payload — participates in the hash. Requests differing in
+ * any of these dimensions never share a cache entry.
+ */
+export async function computeCacheKey(params: CacheKeyParams): Promise<string> {
+  const normalized = {
+    provider: params.provider,
+    model: params.model,
+    clientKeyId: params.clientKeyId ?? null,
+    upstreamId: params.upstreamId ?? null,
+    upstreamBaseUrl: params.upstreamBaseUrl ?? null,
+    body: params.body ?? null,
+  };
+  const payload = stableStringify(normalized) ?? JSON.stringify(normalized);
   const hashBuffer = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(payload)
@@ -302,7 +362,7 @@ export function setCachedResponse(
     sqlite.run(
       `INSERT INTO response_cache (hash, provider, model, response_json, prompt_tokens, completion_tokens, total_tokens, created_at, expires_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(hash) DO UPDATE SET response_json = excluded.response_json, expires_at = excluded.expires_at`,
+       ON CONFLICT(hash) DO UPDATE SET provider = excluded.provider, model = excluded.model, response_json = excluded.response_json, prompt_tokens = excluded.prompt_tokens, completion_tokens = excluded.completion_tokens, total_tokens = excluded.total_tokens, expires_at = excluded.expires_at`,
       [
         hash,
         provider,
