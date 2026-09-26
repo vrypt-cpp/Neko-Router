@@ -118,17 +118,29 @@ export function toPositionalPlaceholders(sql: string): string {
 }
 
 /**
- * Maps a libpq `sslmode` value to a node `tls` connect option.
+ * Maps a libpq `sslmode` value in the connection string to a node `tls` connect
+ * option.
  *
- * `pg` does not read `sslmode` out of the connection string, so a managed
- * provider's `postgres://...?sslmode=require` has to be translated here or the
- * connection fails. `prefer` and `allow` map to no TLS because node-postgres
- * has no silent negotiation: treating them as "require" would break any server
- * that does not offer TLS, which is the opposite of what `prefer` means.
+ * Returns `undefined` — deliberately *not* `false` — when the URL expresses no
+ * preference, so `pg` falls back to its own resolution of `PGSSLMODE`,
+ * `PGSSLCERT`, `PGSSLROOTCERT` and friends. That fallback only runs when the
+ * `ssl` option is left `undefined`, because `pg` reads
+ * `typeof config.ssl === 'undefined' ? readSSLConfigFromEnvironment() : config.ssl`.
+ * An explicit `false` therefore does not mean "no preference", it means "no
+ * TLS, whatever the environment says".
+ *
+ * That distinction is not academic. `sslmode` is a libpq setting operators
+ * routinely set through the environment, so treating its absence as a hard
+ * `ssl: false` silently defeats the mechanism every other Postgres tool
+ * honours, and the only symptom is a server-side `pg_hba.conf` complaint.
  */
-function sslFromConnectionString(connectionString: string): boolean | object {
+export function sslFromConnectionString(
+  connectionString: string,
+): boolean | object | undefined {
   const match = /[?&]sslmode=([^&]+)/.exec(connectionString);
-  const mode = match?.[1] ? decodeURIComponent(match[1]).toLowerCase() : undefined;
+  const mode = match?.[1]
+    ? decodeURIComponent(match[1]).toLowerCase()
+    : undefined;
 
   switch (mode) {
     case "require":
@@ -138,9 +150,36 @@ function sslFromConnectionString(connectionString: string): boolean | object {
       // loads from PGSSLROOTCERT. Without one, require encryption but do not
       // claim the peer is verified.
       return { rejectUnauthorized: mode !== "require" };
-    default:
+    case "disable":
       return false;
+    default:
+      return undefined;
   }
+}
+
+/**
+ * Recognises the "connected without TLS to a server that only accepts TLS"
+ * rejection, which is otherwise reported as an opaque
+ * `no pg_hba.conf entry for host ..., no encryption`.
+ *
+ * Managed PostgreSQL (Aiven, RDS, Cloud SQL, Neon, Supabase) requires TLS and
+ * refuses cleartext connections, so this is the most common failure when moving
+ * an existing deployment onto Postgres. The server-side message names
+ * `pg_hba.conf`, which points the operator at the database rather than at the
+ * connection string that actually caused it.
+ */
+export function isTlsRequiredError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  return (
+    message.includes("no encryption") ||
+    // libpq wording used by some proxies and newer servers.
+    /SSL is required|sslmode\s*=\s*require/i.test(message)
+  );
 }
 
 export class PostgresDriver implements DbDriver {
@@ -154,16 +193,30 @@ export class PostgresDriver implements DbDriver {
 
   constructor(
     connectionString: string,
-    options: { max?: number; ssl?: boolean | object } = {}
+    options: { max?: number; ssl?: boolean | object } = {},
   ) {
     this.pool = new pg.Pool({
       connectionString,
       max: options.max ?? 10,
-      // `pg` ignores `sslmode` in the connection string, so the mode is
-      // translated here. Defaulting to TLS-on instead would break the ordinary
-      // self-hosted case (`postgres://user:pass@host:5432/db` against a
-      // container), which is the overwhelmingly common deployment.
+      // `pg` does not translate `sslmode` from the connection string, so the
+      // mode is resolved here. Leaving it `undefined` when the URL is silent
+      // keeps `PGSSLMODE` working; forcing TLS on instead would break the
+      // ordinary self-hosted case (`postgres://user:pass@host:5432/db` against
+      // a container with no TLS configured), which is the common deployment.
       ssl: options.ssl ?? sslFromConnectionString(connectionString),
+    });
+
+    // A pool that cannot connect reports the failure on every queued request,
+    // which buries the cause under repeated stack traces. Annotate it once, at
+    // the point where the operator can act on it.
+    this.pool.on("error", (error) => {
+      if (isTlsRequiredError(error)) {
+        console.error(
+          `[db] PostgreSQL refused a cleartext connection (${error.message}).\n` +
+            `     Managed providers require TLS. Either append ?sslmode=require to\n` +
+            `     DATABASE_URL or set PGSSLMODE=require in the environment.`,
+        );
+      }
     });
   }
 
@@ -187,17 +240,21 @@ export class PostgresDriver implements DbDriver {
 
   async query<T = Record<string, unknown>>(
     sql: string,
-    params: SqlParams = []
+    params: SqlParams = [],
   ): Promise<T[]> {
-    const result = await this.runner.query(toPositionalPlaceholders(sql), [...params]);
+    const result = await this.runner.query(toPositionalPlaceholders(sql), [
+      ...params,
+    ]);
     return result.rows as T[];
   }
 
   async queryOne<T = Record<string, unknown>>(
     sql: string,
-    params: SqlParams = []
+    params: SqlParams = [],
   ): Promise<T | null> {
-    const result = await this.runner.query(toPositionalPlaceholders(sql), [...params]);
+    const result = await this.runner.query(toPositionalPlaceholders(sql), [
+      ...params,
+    ]);
     return (result.rows[0] as T | undefined) ?? null;
   }
 

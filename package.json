@@ -9,7 +9,8 @@
     "start": "bun --watch src/index.ts",
     "db:smoke": "bun run scripts/db-smoke.ts",
     "db:e2e": "bun run scripts/e2e-smoke.ts",
-    "db:audit": "bun run scripts/audit-missing-await.ts"
+    "db:audit": "bun run scripts/audit-missing-await.ts",
+    "db:ssl": "bun run scripts/ssl-test.ts"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
