@@ -1,5 +1,9 @@
 import { Elysia, t } from "elysia";
-import { getTelemetryStats, getRecentLogs, getActiveUpstreamIds } from "../services/telemetry";
+import {
+  getTelemetryStats,
+  getRecentLogs,
+  getActiveUpstreamIds,
+} from "../services/telemetry";
 import { authMiddleware } from "../middleware/auth";
 
 export const telemetryRoutes = new Elysia({ prefix: "/api/telemetry" })
@@ -11,6 +15,8 @@ export const telemetryRoutes = new Elysia({ prefix: "/api/telemetry" })
     }
   })
   .get("/active", () => {
+    // `getActiveUpstreamIds` reads an in-memory map, so it is genuinely
+    // synchronous and needs no await.
     return {
       activeUpstreamIds: getActiveUpstreamIds(),
     };
@@ -37,10 +43,14 @@ export const telemetryRoutes = new Elysia({ prefix: "/api/telemetry" })
   )
   .get(
     "/logs",
-    ({ query }) => {
+    async ({ query }) => {
       const limit = Math.min(100, Math.max(1, Number(query.limit) || 50));
       const offset = Math.max(0, Number(query.offset) || 0);
-      const logs = getRecentLogs(limit, offset);
+      // Must be awaited, not just returned. Elysia awaits the *handler's* return
+      // value, so returning a bare promise is enough — but a promise nested
+      // inside an object literal is serialised as `{}`, which is what this used
+      // to do and what a status-code-only assertion cannot detect.
+      const logs = await getRecentLogs(limit, offset);
       return { logs };
     },
     {

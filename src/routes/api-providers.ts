@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import { db } from "../db";
+import { db, fetchAll, fetchOne, runStatement } from "../db";
 import { upstreamKeys, clientKeys, apiKeys } from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { eq, and } from "drizzle-orm";
@@ -31,11 +31,10 @@ export const apiProvidersRoutes = new Elysia({ prefix: "/api/api-providers" })
     const inputKeyEntries = parseUpstreamKeyEntries(inputKey.apiKeys, inputKey.apiKey);
 
     // Check if any client key is configured for follow upstream
-    const followClientKeys = db
+    const followClientKeys = await fetchAll(db
       .select()
       .from(clientKeys)
-      .where(eq(clientKeys.isFollowUpstream, 1))
-      .all();
+      .where(eq(clientKeys.isFollowUpstream, 1)));
 
     return {
       success: true,
@@ -117,16 +116,15 @@ export const apiProvidersRoutes = new Elysia({ prefix: "/api/api-providers" })
     "/bandelbanget/toggle",
     async ({ body, set }) => {
       const { id, isActive } = body;
-      const target = db.select().from(upstreamKeys).where(eq(upstreamKeys.id, id)).get();
+      const target = await fetchOne(db.select().from(upstreamKeys).where(eq(upstreamKeys.id, id)));
       if (!target) {
         set.status = 404;
         return { success: false, error: "Provider not found" };
       }
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({ isActive: isActive ? 1 : 0, updatedAt: Date.now() })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return { success: true, isActive };
     },
@@ -145,14 +143,14 @@ export const apiProvidersRoutes = new Elysia({ prefix: "/api/api-providers" })
       const keyLabel = name?.trim() || "BandelBanget Follow Upstream";
 
       // Ensure parent API key exists
-      let parentKey = db.select().from(apiKeys).limit(1).get();
+      let parentKey = await fetchOne(db.select().from(apiKeys).limit(1));
       if (!parentKey) {
         const defaultId = "ak_" + crypto.randomUUID().replace(/-/g, "");
         const randomSuffix = Array.from(crypto.getRandomValues(new Uint8Array(20)))
           .map((b) => b.toString(36))
           .join("")
           .slice(0, 24);
-        db.insert(apiKeys)
+        await runStatement(db.insert(apiKeys)
           .values({
             id: defaultId,
             name: "Default API Key",
@@ -161,9 +159,8 @@ export const apiProvidersRoutes = new Elysia({ prefix: "/api/api-providers" })
             isActive: 1,
             createdAt: Date.now(),
             lastUsedAt: null,
-          })
-          .run();
-        parentKey = db.select().from(apiKeys).where(eq(apiKeys.id, defaultId)).get();
+          }));
+        parentKey = await fetchOne(db.select().from(apiKeys).where(eq(apiKeys.id, defaultId)));
       }
 
       const { followUpstream } = await ensureBandelBangetProviders();
@@ -175,12 +172,12 @@ export const apiProvidersRoutes = new Elysia({ prefix: "/api/api-providers" })
 
       // Check if bb-default is already assigned to a key; if so, create key identifier bb-default or bb-follow-id
       let finalKeyStr = "bb-default";
-      const existing = db.select().from(clientKeys).where(eq(clientKeys.key, finalKeyStr)).get();
+      const existing = await fetchOne(db.select().from(clientKeys).where(eq(clientKeys.key, finalKeyStr)));
       if (existing) {
         finalKeyStr = `bb-follow-${id.slice(3, 9)}`;
       }
 
-      db.insert(clientKeys)
+      await runStatement(db.insert(clientKeys)
         .values({
           id,
           apiKeyId: parentKey?.id || null,
@@ -195,8 +192,7 @@ export const apiProvidersRoutes = new Elysia({ prefix: "/api/api-providers" })
           isFollowUpstream: 1,
           createdAt: now,
           lastUsedAt: null,
-        })
-        .run();
+        }));
 
       return {
         success: true,

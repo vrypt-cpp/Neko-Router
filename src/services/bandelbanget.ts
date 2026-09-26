@@ -1,4 +1,4 @@
-import { db, sqlite } from "../db";
+import { db, fetchOne, runStatement } from "../db";
 import { upstreamKeys, type UpstreamKey } from "../db/schema";
 import { eq, and } from "drizzle-orm";
 import { parseUpstreamModels, parseUpstreamKeyEntries } from "./router";
@@ -148,7 +148,7 @@ export async function ensureBandelBangetProviders(): Promise<{
   const now = Date.now();
 
   // 1. Follow Upstream provider
-  let follow = db
+  let follow = await fetchOne(db
     .select()
     .from(upstreamKeys)
     .where(
@@ -156,16 +156,14 @@ export async function ensureBandelBangetProviders(): Promise<{
         eq(upstreamKeys.baseUrl, BANDELBANGET_CONFIG.BASE_URL),
         eq(upstreamKeys.followUpstream, 1)
       )
-    )
-    .get();
+    ));
 
   if (!follow) {
     // Check by ID or name
-    follow = db
+    follow = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW))
-      .get();
+      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW)));
   }
 
   if (!follow) {
@@ -177,7 +175,7 @@ export async function ensureBandelBangetProviders(): Promise<{
       initialModels = [];
     }
 
-    db.insert(upstreamKeys)
+    await runStatement(db.insert(upstreamKeys)
       .values({
         id: BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW,
         provider: "openai",
@@ -193,17 +191,15 @@ export async function ensureBandelBangetProviders(): Promise<{
         followUpstream: 1,
         createdAt: now,
         updatedAt: now,
-      })
-      .run();
+      }));
 
-    follow = db
+    follow = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW))
-      .get()!;
+      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW)))!;
   } else {
     // Sanitize existing Follow Upstream to ensure zero dummy keys
-    db.update(upstreamKeys)
+    await runStatement(db.update(upstreamKeys)
       .set({
         name: BANDELBANGET_CONFIG.NAME_FOLLOW,
         apiKey: "",
@@ -211,8 +207,7 @@ export async function ensureBandelBangetProviders(): Promise<{
         followUpstream: 1,
         baseUrl: BANDELBANGET_CONFIG.BASE_URL,
       })
-      .where(eq(upstreamKeys.id, follow.id))
-      .run();
+      .where(eq(upstreamKeys.id, follow.id)));
     follow.name = BANDELBANGET_CONFIG.NAME_FOLLOW;
     follow.apiKey = "";
     follow.apiKeys = "[]";
@@ -227,10 +222,9 @@ export async function ensureBandelBangetProviders(): Promise<{
       try {
         const live = await fetchBandelBangetLiveModels();
         if (live.length > 0) {
-          db.update(upstreamKeys)
+          await runStatement(db.update(upstreamKeys)
             .set({ models: JSON.stringify(live), updatedAt: now })
-            .where(eq(upstreamKeys.id, follow.id))
-            .run();
+            .where(eq(upstreamKeys.id, follow.id)));
           follow.models = JSON.stringify(live);
         }
       } catch (e) {}
@@ -238,22 +232,17 @@ export async function ensureBandelBangetProviders(): Promise<{
   }
 
   // 2. Input Key provider
-  let input = db
+  let input = await fetchOne(db
     .select()
     .from(upstreamKeys)
-    .where(
-      and(
-        eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_INPUT)
-      )
-    )
-    .get();
+    .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_INPUT)));
 
   if (!input) {
-    input = db
+    // Fall back to the display name for providers created by an older release.
+    input = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.name, BANDELBANGET_CONFIG.NAME_INPUT))
-      .get();
+      .where(eq(upstreamKeys.name, BANDELBANGET_CONFIG.NAME_INPUT)));
   }
 
   if (!input) {
@@ -264,7 +253,7 @@ export async function ensureBandelBangetProviders(): Promise<{
       liveModels = [];
     }
 
-    db.insert(upstreamKeys)
+    await runStatement(db.insert(upstreamKeys)
       .values({
         id: BANDELBANGET_CONFIG.PROVIDER_ID_INPUT,
         provider: "openai",
@@ -280,26 +269,26 @@ export async function ensureBandelBangetProviders(): Promise<{
         followUpstream: 0,
         createdAt: now,
         updatedAt: now,
-      })
-      .run();
+      }));
 
-    input = db
+    // The row was just inserted under PROVIDER_ID_INPUT, so this read cannot
+    // miss. Asserting rather than re-checking keeps the rest of the function
+    // working with a definitely-defined provider.
+    input = (await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_INPUT))
-      .get()!;
+      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_INPUT))))!;
   } else {
     // If input key has placeholder or dummy key, clean it up
     if (input.apiKey === "sk-bb-placeholder" || input.apiKey === "bb-default" || input.apiKeys === `[{"id":"key_bb_upstream_default","name":"BB Pass-through","key":"bb-default","isActive":true,"createdAt":${now}}]`) {
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           name: BANDELBANGET_CONFIG.NAME_INPUT,
           apiKey: "",
           apiKeys: JSON.stringify([]),
           baseUrl: BANDELBANGET_CONFIG.BASE_URL,
         })
-        .where(eq(upstreamKeys.id, input.id))
-        .run();
+        .where(eq(upstreamKeys.id, input.id)));
       input.name = BANDELBANGET_CONFIG.NAME_INPUT;
       input.apiKey = "";
       input.apiKeys = "[]";
@@ -315,14 +304,23 @@ export async function ensureBandelBangetProviders(): Promise<{
       try {
         const live = await fetchBandelBangetLiveModels();
         if (live.length > 0) {
-          db.update(upstreamKeys)
+          await runStatement(db.update(upstreamKeys)
             .set({ models: JSON.stringify(live), updatedAt: now })
-            .where(eq(upstreamKeys.id, input.id))
-            .run();
+            .where(eq(upstreamKeys.id, input.id)));
           input.models = JSON.stringify(live);
         }
       } catch (e) {}
     }
+  }
+
+  if (!follow || !input) {
+    // Both providers are inserted by this function when missing, so reaching
+    // this point means a concurrent request deleted or renamed the row in
+    // between. Fail loudly instead of handing the router a half-initialised
+    // provider that would 500 on its first use.
+    throw new Error(
+      "BandelBanget providers are still missing after ensureBandelBangetProviders()"
+    );
   }
 
   return { followUpstream: follow, inputKey: input };
@@ -342,7 +340,7 @@ export async function syncBandelBangetFollowUpstreamModels(): Promise<{
   const now = Date.now();
 
   // Find the follow upstream provider
-  let follow = db
+  let follow = await fetchOne(db
     .select()
     .from(upstreamKeys)
     .where(
@@ -350,25 +348,22 @@ export async function syncBandelBangetFollowUpstreamModels(): Promise<{
         eq(upstreamKeys.baseUrl, BANDELBANGET_CONFIG.BASE_URL),
         eq(upstreamKeys.followUpstream, 1)
       )
-    )
-    .get();
+    ));
 
   if (!follow) {
-    follow = db
+    follow = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW))
-      .get();
+      .where(eq(upstreamKeys.id, BANDELBANGET_CONFIG.PROVIDER_ID_FOLLOW)));
   }
 
   if (follow) {
-    db.update(upstreamKeys)
+    await runStatement(db.update(upstreamKeys)
       .set({
         models: JSON.stringify(liveModels),
         updatedAt: now,
       })
-      .where(eq(upstreamKeys.id, follow.id))
-      .run();
+      .where(eq(upstreamKeys.id, follow.id)));
   }
 
   return {

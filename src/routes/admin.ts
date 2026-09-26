@@ -1,14 +1,43 @@
 import { Elysia, t } from "elysia";
-import { DB_PATH, checkpointWal, initTablesSync, sqlite } from "../db";
+import {
+  DB_PATH,
+  checkpoint,
+  initTables,
+  dbConfig,
+  isFileBackedSqlite,
+  describeConnection,
+  queryOne,
+} from "../db";
 import { authMiddleware } from "../middleware/auth";
-import { Database } from "bun:sqlite";
-import { unlinkSync, copyFileSync, existsSync } from "fs";
+import { existsSync, copyFileSync } from "fs";
 import { join, dirname } from "path";
 import {
   getOptimizationSettings,
   updateOptimizationSettings,
   clearResponseCache,
 } from "../services/optimizer";
+import {
+  BackupError,
+  backupContentType,
+  backupFileExtension,
+  checkSqliteIntegrity,
+  currentDatabaseBackupPath,
+  exportJsonBackup,
+  isJsonBackup,
+  missingRequiredTables,
+  removeIfPresent,
+  restoreJsonBackup,
+  restoreSqliteFile,
+  sqliteTableNames,
+} from "../db/backup";
+
+/** Recognises a SQLite database file from its 16-byte magic header. */
+const isSqliteFile = (bytes: Uint8Array): boolean =>
+  new TextDecoder().decode(bytes.subarray(0, 16)).startsWith("SQLite format 3");
+
+/** 100 bytes is far below any real database but comfortably above a JSON
+ *  document's own headers, so it catches "you uploaded the wrong file". */
+const MIN_UPLOAD_BYTES = 32;
 
 export const adminRoutes = new Elysia({ prefix: "/api/admin" })
   .use(authMiddleware)
@@ -18,13 +47,13 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
       return { error: "Unauthorized access to admin management" };
     }
   })
-  .get("/settings/optimizations", () => {
-    return getOptimizationSettings();
+  .get("/settings/optimizations", async () => {
+    return await getOptimizationSettings();
   })
   .post(
     "/settings/optimizations",
-    ({ body }) => {
-      return updateOptimizationSettings(body);
+    async ({ body }) => {
+      return await updateOptimizationSettings(body);
     },
     {
       body: t.Object({
@@ -37,19 +66,44 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
         requestTimeoutSeconds: t.Optional(t.Number()),
         modelPrefixEnabled: t.Optional(t.Boolean()),
       }),
-    }
+    },
   )
-  .post("/cache/clear", () => {
-    return clearResponseCache();
+  .post("/cache/clear", async () => {
+    return await clearResponseCache();
   })
-  .get("/system", () => {
+  .get("/system", async () => {
     const memory = process.memoryUsage();
-    let dbSize = 0;
+
+    // Only SQLite keeps its whole dataset in a single file whose size can be
+    // read from the filesystem. The networked engines split storage across a
+    // server we do not own, so reporting a number here would be a fiction.
+    let dbSizeBytes: number | null = null;
+    if (isFileBackedSqlite && DB_PATH) {
+      try {
+        dbSizeBytes = (await Bun.file(DB_PATH).arrayBuffer()).byteLength;
+      } catch {
+        dbSizeBytes = null;
+      }
+    }
+
+    let database: {
+      dialect: string;
+      description: string;
+      reachable: boolean;
+    } | null = null;
     try {
-      const file = Bun.file(DB_PATH);
-      dbSize = file.size;
-    } catch (e) {
-      // ignore
+      await queryOne("SELECT 1");
+      database = {
+        dialect: dbConfig.dialect,
+        description: describeConnection(),
+        reachable: true,
+      };
+    } catch {
+      database = {
+        dialect: dbConfig.dialect,
+        description: describeConnection(),
+        reachable: false,
+      };
     }
 
     return {
@@ -60,11 +114,12 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
         rssMb: Math.round((memory.rss / (1024 * 1024)) * 100) / 100,
         heapUsedMb: Math.round((memory.heapUsed / (1024 * 1024)) * 100) / 100,
       },
-      dbSizeBytes: dbSize,
+      dbSizeBytes,
       dbPath: DB_PATH,
+      database,
     };
   })
-  .get("/db/export", ({ isAdmin, set }) => {
+  .get("/db/export", async ({ isAdmin, set }) => {
     // Full database dumps contain every stored secret at once (upstream
     // provider keys, client keys, the PIN hash, and the JWT signing secret).
     // Long-lived nr-api- bearer keys must not be able to exfiltrate them in
@@ -75,16 +130,24 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
       return { error: "Database export requires an admin session" };
     }
 
-    // 1. Truncate WAL to write all transactions into the main .db file
-    checkpointWal();
-
-    const file = Bun.file(DB_PATH);
     const dateStr = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const filename = `neko-router-backup-${dateStr}.sqlite`;
+    const filename = `neko-router-backup-${dateStr}.${backupFileExtension()}`;
 
-    return new Response(file, {
+    if (isFileBackedSqlite) {
+      // Fold the WAL back into the main file so the download is self-contained.
+      await checkpoint();
+      return new Response(Bun.file(DB_PATH), {
+        headers: {
+          "Content-Type": backupContentType(),
+          "Content-Disposition": `attachment; filename="${filename}"`,
+        },
+      });
+    }
+
+    const dump = await exportJsonBackup();
+    return new Response(JSON.stringify(dump, null, 2), {
       headers: {
-        "Content-Type": "application/x-sqlite3",
+        "Content-Type": backupContentType(),
         "Content-Disposition": `attachment; filename="${filename}"`,
       },
     });
@@ -97,7 +160,10 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
       // /db/export above: admin session only.
       if (!isAdmin) {
         set.status = 403;
-        return { success: false, error: "Database import requires an admin session" };
+        return {
+          success: false,
+          error: "Database import requires an admin session",
+        };
       }
 
       const file = body?.file as Blob | null;
@@ -106,169 +172,129 @@ export const adminRoutes = new Elysia({ prefix: "/api/admin" })
         return { success: false, error: "No database file provided" };
       }
 
-      const tempId = crypto.randomUUID().slice(0, 8);
-      const tempPath = join(dirname(DB_PATH), `temp_import_${tempId}.sqlite`);
+      let tempPath: string | null = null;
 
       try {
         const buffer = await file.arrayBuffer();
-        if (buffer.byteLength < 100) {
-          set.status = 400;
-          return { success: false, error: "File too small to be a valid SQLite database" };
-        }
-
-        // Verify SQLite Magic Header
-        const header = new TextDecoder().decode(new Uint8Array(buffer, 0, 16));
-        if (!header.startsWith("SQLite format 3")) {
-          set.status = 400;
-          return { success: false, error: "Invalid SQLite file header" };
-        }
-
-        // Write temp file
-        await Bun.write(tempPath, buffer);
-
-        // Verify integrity and schema
-        const testDb = new Database(tempPath, { readonly: true });
-        try {
-          const integrity = testDb
-            .query("PRAGMA integrity_check;")
-            .get() as { integrity_check?: string } | null;
-
-          if (integrity?.integrity_check !== "ok") {
-            testDb.close();
-            unlinkSync(tempPath);
-            set.status = 400;
-            return {
-              success: false,
-              error: `Database integrity check failed: ${integrity?.integrity_check}`,
-            };
-          }
-
-          // Check required tables
-          const tables = testDb
-            .query("SELECT name FROM sqlite_master WHERE type='table'")
-            .all() as { name: string }[];
-          const tableNames = new Set(tables.map((t) => t.name));
-
-          const required = ["settings", "client_keys", "upstream_keys", "telemetry_logs"];
-          const missing = required.filter((req) => !tableNames.has(req));
-
-          if (missing.length > 0) {
-            testDb.close();
-            unlinkSync(tempPath);
-            set.status = 400;
-            return {
-              success: false,
-              error: `Schema integrity failure: Missing required tables: ${missing.join(", ")}`,
-            };
-          }
-
-          testDb.close();
-        } catch (e: any) {
-          testDb.close();
-          unlinkSync(tempPath);
+        if (buffer.byteLength < MIN_UPLOAD_BYTES) {
           set.status = 400;
           return {
             success: false,
-            error: `Failed to inspect database schema: ${e?.message}`,
+            error: "File too small to be a valid backup",
           };
         }
 
-        // Backup current database using online SQLite VACUUM INTO
-        const backupPath = `${DB_PATH}.bak`;
-        try {
-          if (existsSync(backupPath)) unlinkSync(backupPath);
-          sqlite.run("VACUUM INTO ?", [backupPath]);
-        } catch {
+        // A JSON backup never needs a scratch file; a SQLite file has to be
+        // materialised on disk before it can be attached.
+        if (!isSqliteFile(new Uint8Array(buffer))) {
+          let parsed: unknown;
           try {
+            parsed = JSON.parse(new TextDecoder().decode(buffer));
+          } catch {
+            set.status = 400;
+            return {
+              success: false,
+              error:
+                "File is neither a SQLite database nor a Neko-Router JSON backup",
+            };
+          }
+
+          if (!isJsonBackup(parsed)) {
+            set.status = 400;
+            return {
+              success: false,
+              error:
+                "JSON backup is missing required tables or has an unsupported version",
+            };
+          }
+
+          const summary = await restoreJsonBackup(parsed);
+          await initTables();
+          await checkpoint();
+
+          return {
+            success: true,
+            message: `Restored ${summary.rows} rows across ${summary.tables} tables`,
+            ...summary,
+          };
+        }
+
+        if (dbConfig.dialect !== "sqlite") {
+          set.status = 400;
+          return {
+            success: false,
+            error:
+              "This deployment does not use SQLite, so a .sqlite backup cannot be restored. " +
+              "Export a JSON backup instead.",
+          };
+        }
+
+        tempPath = join(
+          dirname(DB_PATH),
+          `temp_import_${crypto.randomUUID().slice(0, 8)}.sqlite`,
+        );
+        await Bun.write(tempPath, buffer);
+
+        const integrity = await checkSqliteIntegrity(tempPath);
+        if (!integrity.ok) {
+          removeIfPresent(tempPath);
+          set.status = 400;
+          return {
+            success: false,
+            error: `Database integrity check failed: ${integrity.detail}`,
+          };
+        }
+
+        const missing = missingRequiredTables(
+          new Set(await sqliteTableNames(tempPath)),
+        );
+        if (missing.length > 0) {
+          removeIfPresent(tempPath);
+          set.status = 400;
+          return {
+            success: false,
+            error: `Schema integrity failure: Missing required tables: ${missing.join(", ")}`,
+          };
+        }
+
+        // Keep a copy of what is being replaced. SQLite only, for the same
+        // reason the export is.
+        const backupPath = currentDatabaseBackupPath();
+        if (backupPath) {
+          removeIfPresent(backupPath);
+          try {
+            await checkpoint();
             copyFileSync(DB_PATH, backupPath);
-          } catch {}
+          } catch {
+            // A missing pre-restore copy must not block the restore itself.
+          }
         }
 
-        // Attach imported DB and atomically synchronize tables
-        // Avoids file locking (EBUSY) issues on Windows
-        const normalizedTempPath = tempPath.replace(/\\/g, "/");
-        sqlite.run("ATTACH DATABASE ? AS imported_db", [normalizedTempPath]);
-        try {
-          const syncTx = sqlite.transaction(() => {
-            sqlite.run("PRAGMA foreign_keys = OFF;");
+        const summary = await restoreSqliteFile(tempPath);
+        removeIfPresent(tempPath);
+        tempPath = null;
 
-            const importedTables = (
-              sqlite
-                .query(
-                  "SELECT name FROM imported_db.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-                .all() as { name: string }[]
-            ).map((r) => r.name);
-
-            const mainTables = (
-              sqlite
-                .query(
-                  "SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-                .all() as { name: string }[]
-            ).map((r) => r.name);
-
-            for (const table of importedTables) {
-              if (mainTables.includes(table)) {
-                const mainCols = (
-                  sqlite.query(`PRAGMA main.table_info("${table}")`).all() as {
-                    name: string;
-                  }[]
-                ).map((c) => c.name);
-                const importedCols = (
-                  sqlite
-                    .query(`PRAGMA imported_db.table_info("${table}")`)
-                    .all() as { name: string }[]
-                ).map((c) => c.name);
-                const commonCols = mainCols.filter((c) =>
-                  importedCols.includes(c)
-                );
-
-                if (commonCols.length > 0) {
-                  const colList = commonCols.map((c) => `"${c}"`).join(", ");
-                  sqlite.run(`DELETE FROM main."${table}";`);
-                  sqlite.run(
-                    `INSERT INTO main."${table}" (${colList}) SELECT ${colList} FROM imported_db."${table}";`
-                  );
-                }
-              }
-            }
-
-            sqlite.run("PRAGMA foreign_keys = ON;");
-          });
-
-          syncTx();
-        } finally {
-          try {
-            sqlite.run("DETACH DATABASE imported_db;");
-          } catch {}
-        }
-
-        // Clean up temp file
-        if (existsSync(tempPath)) {
-          unlinkSync(tempPath);
-        }
-
-        // Checkpoint WAL to flush imported data cleanly and verify schema
-        initTablesSync();
-        checkpointWal();
+        await initTables();
+        await checkpoint();
 
         return {
           success: true,
-          message: "Database imported and validated successfully",
+          message: `Restored ${summary.rows} rows across ${summary.tables} tables`,
+          ...summary,
         };
       } catch (err: any) {
-        if (existsSync(tempPath)) unlinkSync(tempPath);
-        set.status = 500;
-        return {
-          success: false,
-          error: `Import failed: ${err?.message || "Unknown error"}`,
-        };
+        if (tempPath && existsSync(tempPath)) removeIfPresent(tempPath);
+        const message =
+          err instanceof BackupError
+            ? err.message
+            : err?.message || "Unknown error";
+        set.status = err instanceof BackupError ? 400 : 500;
+        return { success: false, error: `Import failed: ${message}` };
       }
     },
     {
       body: t.Object({
         file: t.File(),
       }),
-    }
+    },
   );

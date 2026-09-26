@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import { db } from "../db";
+import { db, fetchAll, fetchOne, runStatement } from "../db";
 import { upstreamKeys } from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { fetchUpstream, validateBaseUrlInput } from "../services/ssrf";
@@ -479,11 +479,10 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
     }
   )
   .get("/", async ({ isAdmin }) => {
-    const list = db
+    const list = await fetchAll(db
       .select()
       .from(upstreamKeys)
-      .orderBy(desc(upstreamKeys.createdAt))
-      .all();
+      .orderBy(desc(upstreamKeys.createdAt)));
 
     const upstreams = await Promise.all(
       list.map(async (item) => {
@@ -499,10 +498,9 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
             if (live.length > 0) {
               models = live.map((m) => ({ id: m.id, name: m.name || m.id, enabled: Boolean(m.enabled) }));
               try {
-                db.update(upstreamKeys)
+                await runStatement(db.update(upstreamKeys)
                   .set({ models: JSON.stringify(models) })
-                  .where(eq(upstreamKeys.id, item.id))
-                  .run();
+                  .where(eq(upstreamKeys.id, item.id)));
               } catch (e) {}
             }
           } catch (e) {}
@@ -551,12 +549,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
 
     return { upstreams };
   })
-  .get("/:id", ({ params: { id }, set, isAdmin }) => {
-    const item = db
+  .get("/:id", async ({ params: { id }, set, isAdmin }) => {
+    const item = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, id))
-      .get();
+      .where(eq(upstreamKeys.id, id)));
 
     if (!item) {
       set.status = 404;
@@ -691,7 +688,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         }
       }
 
-      db.insert(upstreamKeys)
+      await runStatement(db.insert(upstreamKeys)
         .values({
           id,
           provider,
@@ -707,8 +704,7 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
           followUpstream: isFollowUp ? 1 : 0,
           createdAt: now,
           updatedAt: now,
-        })
-        .run();
+        }));
 
       return {
         success: true,
@@ -764,12 +760,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .patch(
     "/:id",
-    ({ params: { id }, body, set }) => {
-      const existing = db
+    async ({ params: { id }, body, set }) => {
+      const existing = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!existing) {
         set.status = 404;
@@ -879,10 +874,9 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         updateData.models = JSON.stringify(body.models);
       }
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set(updateData)
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return { success: true };
     },
@@ -921,27 +915,25 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       }),
     }
   )
-  .delete("/:id", ({ params: { id }, set }) => {
-    const existing = db
+  .delete("/:id", async ({ params: { id }, set }) => {
+    const existing = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, id))
-      .get();
+      .where(eq(upstreamKeys.id, id)));
 
     if (!existing) {
       set.status = 404;
       return { error: "Upstream key not found" };
     }
 
-    db.delete(upstreamKeys).where(eq(upstreamKeys.id, id)).run();
+    await runStatement(db.delete(upstreamKeys).where(eq(upstreamKeys.id, id)));
     return { success: true };
   })
   .post("/:id/fetch-models", async ({ params: { id }, set }) => {
-    const upstream = db
+    const upstream = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, id))
-      .get();
+      .where(eq(upstreamKeys.id, id)));
 
     if (!upstream) {
       set.status = 404;
@@ -1114,13 +1106,12 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         : (existingEnabledMap.get(modelId) ?? false),
     }));
 
-    db.update(upstreamKeys)
+    await runStatement(db.update(upstreamKeys)
       .set({
         models: JSON.stringify(newModels),
         updatedAt: Date.now(),
       })
-      .where(eq(upstreamKeys.id, id))
-      .run();
+      .where(eq(upstreamKeys.id, id)));
 
     return {
       success: true,
@@ -1131,12 +1122,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   })
   .post(
     "/:id/models/toggle",
-    ({ params: { id }, body, set }) => {
-      const upstream = db
+    async ({ params: { id }, body, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1161,13 +1151,12 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
         );
       }
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           models: JSON.stringify(models),
           updatedAt: Date.now(),
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1185,11 +1174,10 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
     }
   )
   .post("/:id/test", async ({ params: { id }, set }) => {
-    const upstream = db
+    const upstream = await fetchOne(db
       .select()
       .from(upstreamKeys)
-      .where(eq(upstreamKeys.id, id))
-      .get();
+      .where(eq(upstreamKeys.id, id)));
 
     if (!upstream) {
       set.status = 404;
@@ -1211,12 +1199,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   })
   .post(
     "/:id/keys",
-    ({ params: { id }, body, set }) => {
-      const upstream = db
+    async ({ params: { id }, body, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1296,14 +1283,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       const merged = [...existingEntries, ...newEntries];
       const firstActive = merged.find((k) => k.isActive);
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           apiKey: firstActive ? firstActive.key : merged[0]!.key,
           apiKeys: JSON.stringify(merged),
           updatedAt: now,
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1341,12 +1327,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .post(
     "/:id/keys/import",
-    ({ params: { id }, body, set }) => {
-      const upstream = db
+    async ({ params: { id }, body, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1449,14 +1434,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       const merged = [...existingEntries, ...toAdd];
       const firstActive = merged.find((k) => k.isActive);
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           apiKey: firstActive ? firstActive.key : merged[0]!.key,
           apiKeys: JSON.stringify(merged),
           updatedAt: now,
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1496,12 +1480,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .delete(
     "/:id/keys/:keyId",
-    ({ params: { id, keyId }, set }) => {
-      const upstream = db
+    async ({ params: { id, keyId }, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1518,14 +1501,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       const remaining = entries.filter((e) => e.id !== keyId);
       const firstActive = remaining.find((e) => e.isActive);
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           apiKey: firstActive ? firstActive.key : (remaining[0]?.key || ""),
           apiKeys: JSON.stringify(remaining),
           updatedAt: Date.now(),
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1544,12 +1526,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .post(
     "/:id/keys/delete-batch",
-    ({ params: { id }, body, set }) => {
-      const upstream = db
+    async ({ params: { id }, body, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1567,14 +1548,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
       const deletedCount = entries.length - remaining.length;
       const firstActive = remaining.find((e) => e.isActive);
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           apiKey: firstActive ? firstActive.key : (remaining[0]?.key || ""),
           apiKeys: JSON.stringify(remaining),
           updatedAt: Date.now(),
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1599,12 +1579,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .post(
     "/:id/keys/toggle-all",
-    ({ params: { id }, body, set }) => {
-      const upstream = db
+    async ({ params: { id }, body, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1620,14 +1599,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
 
       const firstActive = entries.find((e) => e.isActive);
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           apiKey: firstActive ? firstActive.key : entries[0]!.key,
           apiKeys: JSON.stringify(entries),
           updatedAt: Date.now(),
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1651,12 +1629,11 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   )
   .post(
     "/:id/keys/toggle",
-    ({ params: { id }, body, set }) => {
-      const upstream = db
+    async ({ params: { id }, body, set }) => {
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1675,14 +1652,13 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
 
       const firstActive = entries.find((e) => e.isActive);
 
-      db.update(upstreamKeys)
+      await runStatement(db.update(upstreamKeys)
         .set({
           apiKey: firstActive ? firstActive.key : entries[0]!.key,
           apiKeys: JSON.stringify(entries),
           updatedAt: Date.now(),
         })
-        .where(eq(upstreamKeys.id, id))
-        .run();
+        .where(eq(upstreamKeys.id, id)));
 
       return {
         success: true,
@@ -1709,11 +1685,10 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   .post(
     "/:id/keys/:keyId/test",
     async ({ params: { id, keyId }, set }) => {
-      const upstream = db
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;
@@ -1743,11 +1718,10 @@ export const upstreamRoutes = new Elysia({ prefix: "/api/upstreams" })
   .post(
     "/:id/test-all",
     async ({ params: { id }, set }) => {
-      const upstream = db
+      const upstream = await fetchOne(db
         .select()
         .from(upstreamKeys)
-        .where(eq(upstreamKeys.id, id))
-        .get();
+        .where(eq(upstreamKeys.id, id)));
 
       if (!upstream) {
         set.status = 404;

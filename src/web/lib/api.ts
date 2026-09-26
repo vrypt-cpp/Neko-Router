@@ -3,12 +3,14 @@ import type { App } from "../../index";
 
 // Initialize Eden Treaty client pointing to origin (window.location.origin)
 export const edenClient = treaty<App>(
-  typeof window !== "undefined" ? window.location.origin : "http://localhost:3000"
+  typeof window !== "undefined"
+    ? window.location.origin
+    : "http://localhost:3000",
 );
 
 export async function apiRequest<T = any>(
   path: string,
-  options: RequestInit = {}
+  options: RequestInit = {},
 ): Promise<T> {
   const url = path.startsWith("http")
     ? path
@@ -211,15 +213,32 @@ export interface SystemInfo {
     rssMb: number;
     heapUsedMb: number;
   };
-  dbSizeBytes: number;
+  /**
+   * On-disk size of the database. Only SQLite has one: Postgres and MySQL keep
+   * their data in a server we do not own, so the API reports `null` rather than
+   * inventing a figure. Callers must handle `null` instead of formatting it.
+   */
+  dbSizeBytes: number | null;
+  /**
+   * Filesystem path of the database, present only for a file-backed SQLite
+   * deployment. Empty for an in-memory SQLite database and for the networked
+   * engines, where `database.description` identifies the target instead.
+   */
   dbPath: string;
+  database: {
+    dialect: "sqlite" | "postgresql" | "mysql";
+    /** Connection target with any password redacted. */
+    description: string;
+    /** False when a `SELECT 1` against the server failed. */
+    reachable: boolean;
+  } | null;
 }
 
 export function calculateTokenCost(
   model: string,
   promptTokens: number,
   completionTokens: number,
-  cachedTokens = 0
+  cachedTokens = 0,
 ): number {
   const m = (model || "").toLowerCase();
   let promptRate = 0.5; // per 1M tokens USD
@@ -274,7 +293,11 @@ export function calculateTokenCost(
     promptRate = 0.55;
     completionRate = 2.19;
     cachedRate = 0.14;
-  } else if (m.includes("deepseek-chat") || m.includes("deepseek-v3") || m.includes("deepseek")) {
+  } else if (
+    m.includes("deepseek-chat") ||
+    m.includes("deepseek-v3") ||
+    m.includes("deepseek")
+  ) {
     promptRate = 0.14;
     completionRate = 0.28;
     cachedRate = 0.014;
@@ -302,7 +325,12 @@ export function calculateTokenCost(
     promptRate = 1.6;
     completionRate = 6.4;
     cachedRate = 0.8;
-  } else if (m.includes("flash") || m.includes("mini") || m.includes("small") || m.includes("haiku")) {
+  } else if (
+    m.includes("flash") ||
+    m.includes("mini") ||
+    m.includes("small") ||
+    m.includes("haiku")
+  ) {
     promptRate = 0.15;
     completionRate = 0.6;
     cachedRate = 0.075;
@@ -322,7 +350,8 @@ export function calculateTokenCost(
 }
 
 export function formatCost(cost: number | undefined | null): string {
-  if (cost === undefined || cost === null || isNaN(cost) || cost <= 0) return "$0.00";
+  if (cost === undefined || cost === null || isNaN(cost) || cost <= 0)
+    return "$0.00";
   if (cost < 0.0001) return `<$0.0001`;
   if (cost < 0.001) return `~$${cost.toFixed(4)}`;
   if (cost < 0.01) return `~$${cost.toFixed(4)}`;

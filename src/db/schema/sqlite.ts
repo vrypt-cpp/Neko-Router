@@ -1,3 +1,10 @@
+/**
+ * SQLite schema (default engine, backed by `bun:sqlite`).
+ *
+ * This is the dialect the application shipped with, so its column types are
+ * unchanged from the original hand-written schema. Every `0 | 1` flag and epoch
+ * millisecond timestamp is preserved to keep existing rows readable.
+ */
 import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
 
 export const settings = sqliteTable("settings", {
@@ -9,7 +16,7 @@ export const settings = sqliteTable("settings", {
 export const apiKeys = sqliteTable("api_keys", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
-  key: text("key").notNull().unique(), // nr-api-xxxx (Used for Router Integration / Management API)
+  key: text("key").notNull().unique(),
   description: text("description"),
   isActive: integer("is_active").notNull().default(1),
   createdAt: integer("created_at").notNull(),
@@ -18,33 +25,33 @@ export const apiKeys = sqliteTable("api_keys", {
 
 export const clientKeys = sqliteTable("client_keys", {
   id: text("id").primaryKey(),
-  apiKeyId: text("api_key_id"), // Parent API Key (1 API Key has many Secret Keys)
+  apiKeyId: text("api_key_id"),
   name: text("name").notNull(),
-  key: text("key").notNull().unique(), // sk-neko-xxxx (Secret Key used for AI Proxy requests)
+  key: text("key").notNull().unique(),
   isActive: integer("is_active").notNull().default(1),
-  rateLimit: integer("rate_limit"), // requests per minute
-  tokenLimit: integer("token_limit"), // maximum total tokens allowed (token quota limiter)
-  usedTokens: integer("used_tokens").notNull().default(0), // consumed tokens
-  allowedProviders: text("allowed_providers").notNull().default("[]"), // JSON string array of upstream IDs. Default '[]' (ALL OFF)
-  roundRobinProviders: integer("round_robin_providers").notNull().default(1), // 1 = round robin across eligible providers, 0 = primary only
-  isFollowUpstream: integer("is_follow_upstream").notNull().default(0), // 1 = follow upstream pass-through mode
+  rateLimit: integer("rate_limit"),
+  tokenLimit: integer("token_limit"),
+  usedTokens: integer("used_tokens").notNull().default(0),
+  allowedProviders: text("allowed_providers").notNull().default("[]"),
+  roundRobinProviders: integer("round_robin_providers").notNull().default(1),
+  isFollowUpstream: integer("is_follow_upstream").notNull().default(0),
   createdAt: integer("created_at").notNull(),
   lastUsedAt: integer("last_used_at"),
 });
 
 export const upstreamKeys = sqliteTable("upstream_keys", {
   id: text("id").primaryKey(),
-  provider: text("provider").notNull(), // 'openai' | 'anthropic'
+  provider: text("provider").notNull(),
   name: text("name").notNull(),
-  prefix: text("prefix"), // Custom provider prefix for model IDs (e.g. 'ryzumi', 'oc-prod')
+  prefix: text("prefix"),
   apiKey: text("api_key").notNull(),
-  apiKeys: text("api_keys"), // JSON array string of string[]: pool of keys for load-balancing
-  models: text("models"), // JSON array string of { id: string; name?: string; enabled: boolean }[]
-  baseUrl: text("base_url"), // e.g. https://api.openai.com/v1 or custom proxy
+  apiKeys: text("api_keys"),
+  models: text("models"),
+  baseUrl: text("base_url"),
   isActive: integer("is_active").notNull().default(1),
-  roundRobin: integer("round_robin").notNull().default(1), // 1 = round-robin across active keys, 0 = primary/sequential
+  roundRobin: integer("round_robin").notNull().default(1),
   weight: integer("weight").notNull().default(1),
-  followUpstream: integer("follow_upstream").notNull().default(0), // 1 = follow upstream pass-through & live models
+  followUpstream: integer("follow_upstream").notNull().default(0),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
@@ -79,12 +86,3 @@ export const responseCache = sqliteTable("response_cache", {
   createdAt: integer("created_at").notNull(),
   expiresAt: integer("expires_at").notNull(),
 });
-
-export type Setting = typeof settings.$inferSelect;
-export type ApiKey = typeof apiKeys.$inferSelect;
-export type InsertApiKey = typeof apiKeys.$inferInsert;
-export type ClientKey = typeof clientKeys.$inferSelect;
-export type InsertClientKey = typeof clientKeys.$inferInsert;
-export type UpstreamKey = typeof upstreamKeys.$inferSelect;
-export type TelemetryLog = typeof telemetryLogs.$inferSelect;
-export type ResponseCache = typeof responseCache.$inferSelect;

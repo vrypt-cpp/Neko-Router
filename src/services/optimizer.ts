@@ -1,4 +1,11 @@
-import { sqlite } from "../db";
+import {
+  dbConfig,
+  getSettingsByPrefix,
+  setSetting,
+  execute,
+  query,
+  queryOne,
+} from "../db";
 
 export interface OptimizationSettings {
   cacheEnabled: boolean;
@@ -11,37 +18,92 @@ export interface OptimizationSettings {
   modelPrefixEnabled: boolean;
 }
 
-export function getOptimizationSettings(): OptimizationSettings {
-  try {
-    const rows = sqlite
-      .query("SELECT key, value FROM settings WHERE key LIKE 'opt_%'")
-      .all() as { key: string; value: string }[];
+/**
+ * Values applied when no row exists yet.
+ *
+ * `cacheEnabled` and `modelPrefixEnabled` default to true, which preserves the
+ * original `!== "0"` comparison: an absent setting means enabled.
+ */
+export const DEFAULT_OPTIMIZATION_SETTINGS: OptimizationSettings = {
+  cacheEnabled: true,
+  rtkCompression: false,
+  cavemanMode: false,
+  minifyPrompt: false,
+  cacheTtlSeconds: 3600,
+  httpsOnly: false,
+  requestTimeoutSeconds: 0,
+  modelPrefixEnabled: true,
+};
 
-    const map = new Map(rows.map((r) => [r.key, r.value]));
-    const timeoutVal = parseInt(map.get("opt_request_timeout") || "0", 10);
+/**
+ * Cached settings so the proxy hot path does not query the database per
+ * request. Refreshed on write and on a short TTL, since an operator can also
+ * edit these rows directly.
+ */
+let cachedSettings: OptimizationSettings = { ...DEFAULT_OPTIMIZATION_SETTINGS };
+let cacheLoaded = false;
+let cacheExpiresAt = 0;
+const CACHE_TTL_MS = 5_000;
 
-    return {
-      cacheEnabled: map.get("opt_cache_enabled") !== "0", // Default enabled (1)
-      rtkCompression: map.get("opt_rtk_compression") === "1",
-      cavemanMode: map.get("opt_caveman_mode") === "1",
-      minifyPrompt: map.get("opt_minify_prompt") === "1",
-      cacheTtlSeconds: parseInt(map.get("opt_cache_ttl") || "3600", 10),
+function parseSettings(map: Map<string, string>): OptimizationSettings {
+  const timeoutVal = parseInt(map.get("opt_request_timeout") || "0", 10);
+  const ttlVal = parseInt(map.get("opt_cache_ttl") || "3600", 10);
+
+  return {
+    cacheEnabled: map.get("opt_cache_enabled") !== "0",
+    rtkCompression: map.get("opt_rtk_compression") === "1",
+    cavemanMode: map.get("opt_caveman_mode") === "1",
+    minifyPrompt: map.get("opt_minify_prompt") === "1",
+    cacheTtlSeconds: Number.isFinite(ttlVal) && ttlVal > 0 ? ttlVal : 3600,
     httpsOnly: map.get("opt_https_only") === "1",
     requestTimeoutSeconds: isNaN(timeoutVal) || timeoutVal < 0 ? 0 : timeoutVal,
-    modelPrefixEnabled: map.get("opt_model_prefix_enabled") !== "0", // Default enabled (1)
-  };
-} catch (e) {
-  return {
-    cacheEnabled: true,
-    rtkCompression: false,
-    cavemanMode: false,
-    minifyPrompt: false,
-    cacheTtlSeconds: 3600,
-    httpsOnly: false,
-    requestTimeoutSeconds: 0,
-    modelPrefixEnabled: true,
+    modelPrefixEnabled: map.get("opt_model_prefix_enabled") !== "0",
   };
 }
+
+/**
+ * Reads the settings rows and refreshes the cache.
+ *
+ * Called on boot and whenever the cache expires. On a read failure the previous
+ * values are retained: a transient error must not silently disable caching.
+ */
+export async function loadOptimizationSettings(): Promise<OptimizationSettings> {
+  try {
+    const map = await getSettingsByPrefix("opt_");
+    cachedSettings = parseSettings(map);
+  } catch (e) {
+    // Keep whatever is cached (or the defaults) rather than losing them.
+  }
+  cacheLoaded = true;
+  cacheExpiresAt = Date.now() + CACHE_TTL_MS;
+  return cachedSettings;
+}
+
+/** Marks the cache stale so the next read reloads from the database. */
+export function invalidateOptimizationSettings(): void {
+  cacheLoaded = false;
+  cacheExpiresAt = 0;
+}
+
+/**
+ * Synchronous settings read for the proxy hot path.
+ *
+ * `optimizeRequestBody()` runs on every proxied request, so it must not await a
+ * database round trip. It reads the cache, which is refreshed by
+ * `getOptimizationSettings()` from request handlers.
+ */
+export function getOptimizationSettingsSync(): OptimizationSettings {
+  return cachedSettings;
+}
+
+/**
+ * Settings for handlers that can await a read, refreshing the cache when stale.
+ */
+export async function getOptimizationSettings(): Promise<OptimizationSettings> {
+  if (cacheLoaded && Date.now() < cacheExpiresAt) {
+    return cachedSettings;
+  }
+  return loadOptimizationSettings();
 }
 
 export function isHttpsRequest(request: Request): boolean {
@@ -62,7 +124,8 @@ export function isHttpsRequest(request: Request): boolean {
 }
 
 export function checkHttpsRequirement(request: Request): Response | null {
-  const opt = getOptimizationSettings();
+  // Synchronous read: this runs per request on the proxy path.
+  const opt = getOptimizationSettingsSync();
   if (!opt.httpsOnly) return null;
 
   if (!isHttpsRequest(request)) {
@@ -84,62 +147,48 @@ export function checkHttpsRequirement(request: Request): Response | null {
   return null;
 }
 
-export function updateOptimizationSettings(
+/**
+ * Persists a partial settings update.
+ *
+ * Only the keys present in `settings` are written, so a partial PATCH leaves
+ * the rest untouched. The cache is invalidated afterwards so the next read
+ * reflects what was just written; the returned value is read back from the
+ * database rather than assembled locally, so any server-side normalization is
+ * reflected to the caller.
+ */
+export async function updateOptimizationSettings(
   settings: Partial<OptimizationSettings>
-): OptimizationSettings {
-  const now = Date.now();
+): Promise<OptimizationSettings> {
+  const flag = (value: boolean) => (value ? "1" : "0");
 
   if (settings.cacheEnabled !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_cache_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [settings.cacheEnabled ? "1" : "0", now]
-    );
+    await setSetting("opt_cache_enabled", flag(settings.cacheEnabled));
   }
   if (settings.rtkCompression !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_rtk_compression', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [settings.rtkCompression ? "1" : "0", now]
-    );
+    await setSetting("opt_rtk_compression", flag(settings.rtkCompression));
   }
   if (settings.cavemanMode !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_caveman_mode', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [settings.cavemanMode ? "1" : "0", now]
-    );
+    await setSetting("opt_caveman_mode", flag(settings.cavemanMode));
   }
   if (settings.minifyPrompt !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_minify_prompt', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [settings.minifyPrompt ? "1" : "0", now]
-    );
+    await setSetting("opt_minify_prompt", flag(settings.minifyPrompt));
   }
   if (settings.cacheTtlSeconds !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_cache_ttl', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [String(Math.max(60, settings.cacheTtlSeconds)), now]
-    );
+    await setSetting("opt_cache_ttl", String(Math.max(60, settings.cacheTtlSeconds)));
   }
   if (settings.httpsOnly !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_https_only', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [settings.httpsOnly ? "1" : "0", now]
-    );
+    await setSetting("opt_https_only", flag(settings.httpsOnly));
   }
   if (settings.requestTimeoutSeconds !== undefined) {
     const timeoutVal = Math.max(0, Math.floor(Number(settings.requestTimeoutSeconds) || 0));
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_request_timeout', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [String(timeoutVal), now]
-    );
+    await setSetting("opt_request_timeout", String(timeoutVal));
   }
   if (settings.modelPrefixEnabled !== undefined) {
-    sqlite.run(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('opt_model_prefix_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-      [settings.modelPrefixEnabled ? "1" : "0", now]
-    );
+    await setSetting("opt_model_prefix_enabled", flag(settings.modelPrefixEnabled));
   }
 
-  return getOptimizationSettings();
+  invalidateOptimizationSettings();
+  return loadOptimizationSettings();
 }
 
 /**
@@ -183,7 +232,9 @@ export function minifyContent(text: string): string {
  * Apply active global optimizations to OpenAI / Anthropic request payload
  */
 export function optimizeRequestBody(body: any, provider: "openai" | "anthropic"): any {
-  const opt = getOptimizationSettings();
+  // Synchronous read: this function runs on every proxied request, so it must
+  // not await a database round trip.
+  const opt = getOptimizationSettingsSync();
   if (!opt.rtkCompression && !opt.cavemanMode && !opt.minifyPrompt) {
     return body;
   }
@@ -308,44 +359,57 @@ export async function computeCacheKey(params: CacheKeyParams): Promise<string> {
     .join("");
 }
 
-export function getCachedResponse(hash: string): {
+/**
+ * Reads a cached response.
+ *
+ * An expired entry is deleted on read and reported as a miss. Returns null on
+ * any error: a cache problem must degrade to a real upstream call, never fail
+ * the request.
+ */
+export async function getCachedResponse(hash: string): Promise<{
   responseJson: any;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
-} | null {
+} | null> {
   try {
     const now = Date.now();
-    const row = sqlite
-      .query(
-        "SELECT response_json, prompt_tokens, completion_tokens, total_tokens, expires_at FROM response_cache WHERE hash = ?"
-      )
-      .get(hash) as {
+    const row = await queryOne<{
       response_json: string;
       prompt_tokens: number;
       completion_tokens: number;
       total_tokens: number;
       expires_at: number;
-    } | null;
+    }>(
+      "SELECT response_json, prompt_tokens, completion_tokens, total_tokens, expires_at FROM response_cache WHERE hash = ?",
+      [hash]
+    );
 
     if (!row) return null;
-    if (row.expires_at < now) {
-      sqlite.run("DELETE FROM response_cache WHERE hash = ?", [hash]);
+    if (Number(row.expires_at) < now) {
+      await execute("DELETE FROM response_cache WHERE hash = ?", [hash]);
       return null;
     }
 
     return {
       responseJson: JSON.parse(row.response_json),
-      promptTokens: row.prompt_tokens,
-      completionTokens: row.completion_tokens,
-      totalTokens: row.total_tokens,
+      promptTokens: Number(row.prompt_tokens),
+      completionTokens: Number(row.completion_tokens),
+      totalTokens: Number(row.total_tokens),
     };
   } catch (e) {
     return null;
   }
 }
 
-export function setCachedResponse(
+/**
+ * Stores a response in the cache, replacing any existing entry for the hash.
+ *
+ * The upsert form differs per engine, so the statement is selected by dialect
+ * rather than emulated with a delete-then-insert (which would leave a window
+ * with no entry and race with concurrent readers).
+ */
+export async function setCachedResponse(
   hash: string,
   provider: string,
   model: string,
@@ -353,44 +417,116 @@ export function setCachedResponse(
   promptTokens: number,
   completionTokens: number,
   ttlSeconds = 3600
-): void {
+): Promise<void> {
   try {
     const now = Date.now();
     const expiresAt = now + ttlSeconds * 1000;
     const jsonStr = JSON.stringify(responseObj);
+    const total = promptTokens + completionTokens;
 
-    sqlite.run(
-      `INSERT INTO response_cache (hash, provider, model, response_json, prompt_tokens, completion_tokens, total_tokens, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(hash) DO UPDATE SET provider = excluded.provider, model = excluded.model, response_json = excluded.response_json, prompt_tokens = excluded.prompt_tokens, completion_tokens = excluded.completion_tokens, total_tokens = excluded.total_tokens, expires_at = excluded.expires_at`,
-      [
-        hash,
-        provider,
-        model,
-        jsonStr,
-        promptTokens,
-        completionTokens,
-        promptTokens + completionTokens,
-        now,
-        expiresAt,
-      ]
-    );
+    const assignments = [
+      "provider = ?",
+      "model = ?",
+      "response_json = ?",
+      "prompt_tokens = ?",
+      "completion_tokens = ?",
+      "total_tokens = ?",
+      "expires_at = ?",
+    ].join(", ");
+
+    if (dbConfig.dialect === "postgresql") {
+      await execute(
+        `INSERT INTO response_cache (hash, provider, model, response_json, prompt_tokens, completion_tokens, total_tokens, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (hash) DO UPDATE SET ${assignments}`,
+        [
+          hash,
+          provider,
+          model,
+          jsonStr,
+          promptTokens,
+          completionTokens,
+          total,
+          now,
+          expiresAt,
+        ]
+      );
+    } else if (dbConfig.dialect === "mysql") {
+      // MySQL has no `excluded`; VALUES() refers to the proposed row.
+      await execute(
+        `INSERT INTO response_cache (hash, provider, model, response_json, prompt_tokens, completion_tokens, total_tokens, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           provider = VALUES(provider),
+           model = VALUES(model),
+           response_json = VALUES(response_json),
+           prompt_tokens = VALUES(prompt_tokens),
+           completion_tokens = VALUES(completion_tokens),
+           total_tokens = VALUES(total_tokens),
+           expires_at = VALUES(expires_at)`,
+        [
+          hash,
+          provider,
+          model,
+          jsonStr,
+          promptTokens,
+          completionTokens,
+          total,
+          now,
+          expiresAt,
+        ]
+      );
+    } else {
+      await execute(
+        `INSERT INTO response_cache (hash, provider, model, response_json, prompt_tokens, completion_tokens, total_tokens, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET ${assignments}`,
+        [
+          hash,
+          provider,
+          model,
+          jsonStr,
+          promptTokens,
+          completionTokens,
+          total,
+          now,
+          expiresAt,
+        ]
+      );
+    }
   } catch (e) {
+    // A failed cache write must not fail the request being served.
     console.error("Failed to save response cache:", e);
   }
 }
 
-export function clearResponseCache(): { cleared: number } {
+/** Empties the response cache and reports how many rows were removed. */
+export async function clearResponseCache(): Promise<{ cleared: number }> {
   try {
-    const count =
-      (
-        sqlite
-          .query("SELECT count(*) as count FROM response_cache")
-          .get() as { count: number }
-      )?.count || 0;
-    sqlite.run("DELETE FROM response_cache;");
+    const row = await queryOne<{ count: number }>(
+      "SELECT count(*) as count FROM response_cache"
+    );
+    const count = Number(row?.count ?? 0);
+    await execute("DELETE FROM response_cache");
     return { cleared: count };
   } catch (e) {
     return { cleared: 0 };
+  }
+}
+
+/** Deletes expired cache entries. Intended to be called on a timer. */
+export async function purgeExpiredCacheEntries(): Promise<number> {
+  try {
+    const row = await queryOne<{ count: number }>(
+      "SELECT count(*) as count FROM response_cache WHERE expires_at < ?",
+      [Date.now()]
+    );
+    const count = Number(row?.count ?? 0);
+    if (count > 0) {
+      await execute("DELETE FROM response_cache WHERE expires_at < ?", [Date.now()]);
+    }
+    return count;
+  } catch (e) {
+    return 0;
   }
 }

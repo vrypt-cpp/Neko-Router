@@ -12,11 +12,12 @@ import {
 import { recordTelemetry, registerActiveRequest } from "./telemetry";
 import { incrementClientKeyTokens, checkClientRateLimit } from "./auth";
 import { fetchUpstream } from "./ssrf";
-import { db } from "../db";
+import { db, fetchOne } from "../db";
 import { upstreamKeys, type ClientKey, type UpstreamKey } from "../db/schema";
 import { eq, or, like, and } from "drizzle-orm";
 import {
   getOptimizationSettings,
+  getOptimizationSettingsSync,
   optimizeRequestBody,
   computeCacheKey,
   getCachedResponse,
@@ -65,7 +66,7 @@ function isRetryableStatus(status: number): boolean {
 function buildFailoverKeyCandidates(
   primaryKey: string,
   entries: { key: string }[],
-  maxAttempts = FAILOVER_MAX_ATTEMPTS
+  maxAttempts = FAILOVER_MAX_ATTEMPTS,
 ): string[] {
   const seen = new Set<string>();
   const unique: string[] = [];
@@ -104,55 +105,71 @@ export async function proxyOpenAIChatCompletions(
   reqHeaders: Headers,
   body: any,
   clientKey: ClientKey | null,
-  clientSignal?: AbortSignal
+  clientSignal?: AbortSignal,
 ): Promise<Response> {
   const startTime = performance.now();
-  const requestedModel = (body && typeof body === "object" ? body.model : "") || "unknown";
-const selection = selectUpstreamCandidates(
-  "openai",
-  requestedModel,
-  clientKey,
-  FAILOVER_MAX_PROVIDERS
-);
-const { upstreams: upstreamCandidates, blocked: selfLoopUpstreams } =
-  filterSelfReferencingUpstreams(selection.upstreams, reqHeaders);
+  const requestedModel =
+    (body && typeof body === "object" ? body.model : "") || "unknown";
+  const selection = await selectUpstreamCandidates(
+    "openai",
+    requestedModel,
+    clientKey,
+    FAILOVER_MAX_PROVIDERS,
+  );
+  const { upstreams: upstreamCandidates, blocked: selfLoopUpstreams } =
+    filterSelfReferencingUpstreams(selection.upstreams, reqHeaders);
 
-if (upstreamCandidates.length === 0) {
-  if (selfLoopUpstreams.length > 0) {
+  if (upstreamCandidates.length === 0) {
+    if (selfLoopUpstreams.length > 0) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "Upstream provider points back to Neko-Router's own endpoint (routing loop detected). Change its Base URL to a real upstream provider.",
+            type: "router_error",
+            code: "upstream_self_loop",
+          },
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    const isForbidden = selection.error === "no_allowed_providers";
+    const isModelDisabled = selection.error === "model_not_enabled";
     return new Response(
       JSON.stringify({
         error: {
           message:
-            "Upstream provider points back to Neko-Router's own endpoint (routing loop detected). Change its Base URL to a real upstream provider.",
-          type: "router_error",
-          code: "upstream_self_loop",
+            selection.message ||
+            (isModelDisabled
+              ? `Model '${requestedModel}' is not enabled on any active OpenAI upstream provider. Enable it in Upstream Settings.`
+              : "No active OpenAI upstream provider configured in Neko-Router"),
+          type: isForbidden
+            ? "permission_error"
+            : isModelDisabled
+              ? "invalid_request_error"
+              : "router_error",
+          code: isForbidden
+            ? "provider_access_denied"
+            : isModelDisabled
+              ? "model_not_enabled"
+              : "no_upstream_key",
         },
       }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+      {
+        status: isForbidden ? 403 : isModelDisabled ? 400 : 503,
+        headers: { "Content-Type": "application/json" },
+      },
     );
   }
-  const isForbidden = selection.error === "no_allowed_providers";
-  const isModelDisabled = selection.error === "model_not_enabled";
-  return new Response(
-    JSON.stringify({
-      error: {
-        message:
-          selection.message ||
-          (isModelDisabled
-            ? `Model '${requestedModel}' is not enabled on any active OpenAI upstream provider. Enable it in Upstream Settings.`
-            : "No active OpenAI upstream provider configured in Neko-Router"),
-        type: isForbidden ? "permission_error" : isModelDisabled ? "invalid_request_error" : "router_error",
-        code: isForbidden ? "provider_access_denied" : isModelDisabled ? "model_not_enabled" : "no_upstream_key",
-      },
-    }),
-    { status: isForbidden ? 403 : isModelDisabled ? 400 : 503, headers: { "Content-Type": "application/json" } }
-  );
-}
 
   let upstream: UpstreamKey = upstreamCandidates[0]!;
 
   if (clientKey) {
-    if (clientKey.tokenLimit !== null && clientKey.tokenLimit !== undefined && clientKey.tokenLimit > 0) {
+    if (
+      clientKey.tokenLimit !== null &&
+      clientKey.tokenLimit !== undefined &&
+      clientKey.tokenLimit > 0
+    ) {
       if ((clientKey.usedTokens || 0) >= clientKey.tokenLimit) {
         return new Response(
           JSON.stringify({
@@ -162,12 +179,15 @@ if (upstreamCandidates.length === 0) {
               code: "insufficient_quota",
             },
           }),
-          { status: 429, headers: { "Content-Type": "application/json" } }
+          { status: 429, headers: { "Content-Type": "application/json" } },
         );
       }
     }
 
-    if (clientKey.rateLimit && !checkClientRateLimit(clientKey.id, clientKey.rateLimit)) {
+    if (
+      clientKey.rateLimit &&
+      !checkClientRateLimit(clientKey.id, clientKey.rateLimit)
+    ) {
       return new Response(
         JSON.stringify({
           error: {
@@ -181,23 +201,36 @@ if (upstreamCandidates.length === 0) {
           headers: {
             "Content-Type": "application/json",
           },
-        }
+        },
       );
     }
   }
 
-  // Load optimization settings
-  const opt = getOptimizationSettings();
+  // Load optimization settings. Read from the in-process cache: this runs on
+  // every proxied request, so it must not await a database round trip.
+  const opt = getOptimizationSettingsSync();
   const optimizedBody = optimizeRequestBody(body, "openai");
 
   // Normalize model name for upstream: if provider or custom prefix was sent (e.g. "openai/gpt-4o" or "ryzumi/auto"), strip it unless custom gateway
-  if (optimizedBody && typeof optimizedBody.model === "string" && optimizedBody.model.includes("/")) {
-    const isCustomGateway = upstream.baseUrl && (upstream.baseUrl.includes("openrouter") || upstream.baseUrl.includes("together") || upstream.baseUrl.includes("groq"));
+  if (
+    optimizedBody &&
+    typeof optimizedBody.model === "string" &&
+    optimizedBody.model.includes("/")
+  ) {
+    const isCustomGateway =
+      upstream.baseUrl &&
+      (upstream.baseUrl.includes("openrouter") ||
+        upstream.baseUrl.includes("together") ||
+        upstream.baseUrl.includes("groq"));
     if (!isCustomGateway) {
       const parts = optimizedBody.model.split("/");
       const prefix = parts[0].toLowerCase();
       const upPrefix = (upstream.prefix || "").toLowerCase();
-      if (prefix === "openai" || prefix === upstream.provider.toLowerCase() || (upPrefix && prefix === upPrefix)) {
+      if (
+        prefix === "openai" ||
+        prefix === upstream.provider.toLowerCase() ||
+        (upPrefix && prefix === upPrefix)
+      ) {
         optimizedBody.model = parts.slice(1).join("/");
       }
     }
@@ -220,11 +253,18 @@ if (upstreamCandidates.length === 0) {
   if (clientSignal) {
     if (clientSignal.aborted) {
       finishActive();
-      return new Response(JSON.stringify({ error: { message: "Client aborted request" } }), { status: 499 });
+      return new Response(
+        JSON.stringify({ error: { message: "Client aborted request" } }),
+        { status: 499 },
+      );
     }
-    clientSignal.addEventListener("abort", () => {
-      finishActive();
-    }, { once: true });
+    clientSignal.addEventListener(
+      "abort",
+      () => {
+        finishActive();
+      },
+      { once: true },
+    );
   }
 
   // Check Exact Response Cache
@@ -239,11 +279,20 @@ if (upstreamCandidates.length === 0) {
         upstreamBaseUrl: getBaseUrl(upstream),
         body: optimizedBody,
       });
-      const cached = getCachedResponse(cacheKey);
+      const cached = await getCachedResponse(cacheKey);
       if (cached) {
         finishActive();
-        const durationMs = Math.max(1, Math.round(performance.now() - startTime));
-        recordTelemetry({
+        const durationMs = Math.max(
+          1,
+          Math.round(performance.now() - startTime),
+        );
+        // Usage accounting is deliberately not awaited: it must not delay or
+        // fail the response. This is now genuinely concurrent rather than
+        // merely unawaited — under SQLite the write completed before this line
+        // returned, so the `void` was cosmetic. `recordTelemetry`,
+        // `incrementClientKeyTokens` and `setCachedResponse` each catch and log
+        // their own errors, so no rejection escapes.
+        void recordTelemetry({
           clientKeyId: clientKey?.id,
           clientKeyName: clientKey?.name,
           upstreamKeyId: upstream.id,
@@ -260,32 +309,32 @@ if (upstreamCandidates.length === 0) {
         });
 
         if (clientKey && cached.completionTokens > 0) {
-          incrementClientKeyTokens(clientKey.id, cached.completionTokens);
+          void incrementClientKeyTokens(clientKey.id, cached.completionTokens);
         }
 
         if (isStream) {
-          const content = cached.responseJson?.choices?.[0]?.message?.content || "";
-          const ssePayload =
-            `data: ${JSON.stringify({
-              id: "chatcmpl-cache-" + Date.now(),
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model,
-              choices: [{ index: 0, delta: { content }, finish_reason: "stop" }],
-              usage: {
-                prompt_tokens: cached.promptTokens,
-                completion_tokens: cached.completionTokens,
-                total_tokens: cached.totalTokens,
-                prompt_tokens_details: { cached_tokens: cached.promptTokens },
-              },
-            })}\n\ndata: [DONE]\n\n`;
+          const content =
+            cached.responseJson?.choices?.[0]?.message?.content || "";
+          const ssePayload = `data: ${JSON.stringify({
+            id: "chatcmpl-cache-" + Date.now(),
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { content }, finish_reason: "stop" }],
+            usage: {
+              prompt_tokens: cached.promptTokens,
+              completion_tokens: cached.completionTokens,
+              total_tokens: cached.totalTokens,
+              prompt_tokens_details: { cached_tokens: cached.promptTokens },
+            },
+          })}\n\ndata: [DONE]\n\n`;
 
           return new Response(ssePayload, {
             status: 200,
             headers: {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
-              "Connection": "keep-alive",
+              Connection: "keep-alive",
               "X-Cache-Status": "HIT",
             },
           });
@@ -312,13 +361,13 @@ if (upstreamCandidates.length === 0) {
     };
   }
 
-let isCodex =
-  upstream.baseUrl?.includes("chatgpt.com/backend-api/codex") ||
-  upstream.name.toLowerCase().includes("codex");
+  let isCodex =
+    upstream.baseUrl?.includes("chatgpt.com/backend-api/codex") ||
+    upstream.name.toLowerCase().includes("codex");
 
-let upstreamUrl = isCodex
-  ? (upstream.baseUrl?.trim() || CODEX_CONFIG.BASE_URL)
-  : `${getBaseUrl(upstream)}/chat/completions`;
+  let upstreamUrl = isCodex
+    ? upstream.baseUrl?.trim() || CODEX_CONFIG.BASE_URL
+    : `${getBaseUrl(upstream)}/chat/completions`;
 
   const timeoutSeconds = Number(opt.requestTimeoutSeconds) || 0;
   const controller = new AbortController();
@@ -342,15 +391,15 @@ let upstreamUrl = isCodex
           controller.abort();
           finishActive();
         },
-        { once: true }
+        { once: true },
       );
     }
   }
 
-const performOpenAIFetch = async (
-  currentUpstreamKey: string
-): Promise<Response> => {
-  let upstreamHeaders: Record<string, string>;
+  const performOpenAIFetch = async (
+    currentUpstreamKey: string,
+  ): Promise<Response> => {
+    let upstreamHeaders: Record<string, string>;
 
     const isCopilot =
       upstream.baseUrl?.includes("githubcopilot.com") ||
@@ -375,10 +424,18 @@ const performOpenAIFetch = async (
       upstreamHeaders = getCopilotHeaders(internalToken, isStream);
       requestPayload = transformCopilotRequestBody(optimizedBody, model);
     } else if (isAntigravity) {
-      const entries = parseUpstreamKeyEntries(upstream.apiKeys, upstream.apiKey);
-      antigravityEntry = entries.find((e) => e.key === currentUpstreamKey) || entries.find((e) => e.isActive);
+      const entries = parseUpstreamKeyEntries(
+        upstream.apiKeys,
+        upstream.apiKey,
+      );
+      antigravityEntry =
+        entries.find((e) => e.key === currentUpstreamKey) ||
+        entries.find((e) => e.isActive);
       if (antigravityEntry) {
-        effectiveAntigravityKey = await ensureAntigravityAccessToken(upstream.id, antigravityEntry);
+        effectiveAntigravityKey = await ensureAntigravityAccessToken(
+          upstream.id,
+          antigravityEntry,
+        );
       }
 
       const isStream = Boolean(optimizedBody?.stream);
@@ -390,10 +447,18 @@ const performOpenAIFetch = async (
         Accept: isStream ? "text/event-stream" : "application/json",
       };
     } else if (isCodex) {
-      const entries = parseUpstreamKeyEntries(upstream.apiKeys, upstream.apiKey);
-      codexEntry = entries.find((e) => e.key === currentUpstreamKey) || entries.find((e) => e.isActive);
+      const entries = parseUpstreamKeyEntries(
+        upstream.apiKeys,
+        upstream.apiKey,
+      );
+      codexEntry =
+        entries.find((e) => e.key === currentUpstreamKey) ||
+        entries.find((e) => e.isActive);
       if (codexEntry) {
-        effectiveCodexKey = await ensureCodexAccessToken(upstream.id, codexEntry);
+        effectiveCodexKey = await ensureCodexAccessToken(
+          upstream.id,
+          codexEntry,
+        );
       }
 
       const isStream = Boolean(optimizedBody?.stream);
@@ -405,7 +470,8 @@ const performOpenAIFetch = async (
         Accept: isStream ? "text/event-stream" : "application/json",
       };
       if (codexEntry?.chatgptAccountId) {
-        (upstreamHeaders as any)["chatgpt-account-id"] = codexEntry.chatgptAccountId;
+        (upstreamHeaders as any)["chatgpt-account-id"] =
+          codexEntry.chatgptAccountId;
       }
       requestPayload = transformChatToCodexResponses(optimizedBody, model);
     } else {
@@ -420,7 +486,9 @@ const performOpenAIFetch = async (
         // public default instead of being forwarded upstream.
         const clientAuth = reqHeaders.get("Authorization");
         const clientKeyHeader = reqHeaders.get("x-api-key");
-        const passedKey = clientAuth?.startsWith("Bearer ") ? clientAuth.slice(7).trim() : clientKeyHeader?.trim();
+        const passedKey = clientAuth?.startsWith("Bearer ")
+          ? clientAuth.slice(7).trim()
+          : clientKeyHeader?.trim();
         const authenticatedKey = clientKey?.key;
         if (
           passedKey &&
@@ -441,157 +509,165 @@ const performOpenAIFetch = async (
       };
     }
 
-  // All upstream fetches go through fetchUpstream (SSRF validation + redirect checks).
-  let response = await fetchUpstream(upstreamUrl, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: JSON.stringify(requestPayload),
-    signal: controller.signal,
-  });
+    // All upstream fetches go through fetchUpstream (SSRF validation + redirect checks).
+    let response = await fetchUpstream(upstreamUrl, {
+      method: "POST",
+      headers: upstreamHeaders,
+      body: JSON.stringify(requestPayload),
+      signal: controller.signal,
+    });
 
-  // If Antigravity returns 401 Unauthorized, force-refresh token and retry once
-  if (isAntigravity && response.status === 401 && antigravityEntry?.refreshToken) {
-    try {
-      const refreshedToken = await forceRefreshAntigravityToken(upstream.id, antigravityEntry);
-      upstreamHeaders.Authorization = `Bearer ${refreshedToken}`;
-      response = await fetchUpstream(upstreamUrl, {
-        method: "POST",
-        headers: upstreamHeaders,
-        body: JSON.stringify(requestPayload),
-        signal: controller.signal,
-      });
-    } catch (refreshErr) {
-      // Continue with original response
-    }
-  }
-
-  // If Codex returns 401 Unauthorized, refresh token and retry once
-  if (isCodex && response.status === 401 && codexEntry?.refreshToken) {
-    try {
-      const refreshed = await refreshCodexToken(codexEntry.refreshToken);
-      codexEntry.key = refreshed.accessToken;
-      if (refreshed.refreshToken) codexEntry.refreshToken = refreshed.refreshToken;
-      if (refreshed.expiresAt) codexEntry.expiresAt = refreshed.expiresAt;
-      upstreamHeaders.Authorization = `Bearer ${refreshed.accessToken}`;
-      response = await fetchUpstream(upstreamUrl, {
-        method: "POST",
-        headers: upstreamHeaders,
-        body: JSON.stringify(requestPayload),
-        signal: controller.signal,
-      });
-    } catch (refreshErr) {
-      // Continue with original response
-    }
-  }
-
-  return response;
-};
-
-let upstreamResponse!: Response;
-let responseResolved = false;
-let lastAttemptError: any = null;
-let lastErrorResponse: Response | null = null;
-
-providerLoop: for (const candidate of upstreamCandidates) {
-  upstream = candidate;
-  finishActive.setUpstream(candidate.id);
-  isCodex =
-    candidate.baseUrl?.includes("chatgpt.com/backend-api/codex") ||
-    candidate.name.toLowerCase().includes("codex");
-  upstreamUrl = isCodex
-    ? (candidate.baseUrl?.trim() || CODEX_CONFIG.BASE_URL)
-    : `${getBaseUrl(candidate)}/chat/completions`;
-
-  const keyCandidates = buildFailoverKeyCandidates(
-    getApiKeyForUpstream(candidate),
-    getActiveUpstreamKeyEntries(candidate)
-  );
-
-  for (let attempt = 0; attempt < keyCandidates.length; attempt++) {
-    try {
-      const response = await performOpenAIFetch(keyCandidates[attempt]!);
-      if (response.ok) {
-        if (lastErrorResponse) {
-          try {
-            await lastErrorResponse.body?.cancel();
-          } catch (cancelErr) {
-            // Ignore body cancellation failure
-          }
-          lastErrorResponse = null;
-        }
-        upstreamResponse = response;
-        responseResolved = true;
-        break providerLoop;
+    // If Antigravity returns 401 Unauthorized, force-refresh token and retry once
+    if (
+      isAntigravity &&
+      response.status === 401 &&
+      antigravityEntry?.refreshToken
+    ) {
+      try {
+        const refreshedToken = await forceRefreshAntigravityToken(
+          upstream.id,
+          antigravityEntry,
+        );
+        upstreamHeaders.Authorization = `Bearer ${refreshedToken}`;
+        response = await fetchUpstream(upstreamUrl, {
+          method: "POST",
+          headers: upstreamHeaders,
+          body: JSON.stringify(requestPayload),
+          signal: controller.signal,
+        });
+      } catch (refreshErr) {
+        // Continue with original response
       }
-      if (!isRetryableStatus(response.status)) {
+    }
+
+    // If Codex returns 401 Unauthorized, refresh token and retry once
+    if (isCodex && response.status === 401 && codexEntry?.refreshToken) {
+      try {
+        const refreshed = await refreshCodexToken(codexEntry.refreshToken);
+        codexEntry.key = refreshed.accessToken;
+        if (refreshed.refreshToken)
+          codexEntry.refreshToken = refreshed.refreshToken;
+        if (refreshed.expiresAt) codexEntry.expiresAt = refreshed.expiresAt;
+        upstreamHeaders.Authorization = `Bearer ${refreshed.accessToken}`;
+        response = await fetchUpstream(upstreamUrl, {
+          method: "POST",
+          headers: upstreamHeaders,
+          body: JSON.stringify(requestPayload),
+          signal: controller.signal,
+        });
+      } catch (refreshErr) {
+        // Continue with original response
+      }
+    }
+
+    return response;
+  };
+
+  let upstreamResponse!: Response;
+  let responseResolved = false;
+  let lastAttemptError: any = null;
+  let lastErrorResponse: Response | null = null;
+
+  providerLoop: for (const candidate of upstreamCandidates) {
+    upstream = candidate;
+    finishActive.setUpstream(candidate.id);
+    isCodex =
+      candidate.baseUrl?.includes("chatgpt.com/backend-api/codex") ||
+      candidate.name.toLowerCase().includes("codex");
+    upstreamUrl = isCodex
+      ? candidate.baseUrl?.trim() || CODEX_CONFIG.BASE_URL
+      : `${getBaseUrl(candidate)}/chat/completions`;
+
+    const keyCandidates = buildFailoverKeyCandidates(
+      getApiKeyForUpstream(candidate),
+      getActiveUpstreamKeyEntries(candidate),
+    );
+
+    for (let attempt = 0; attempt < keyCandidates.length; attempt++) {
+      try {
+        const response = await performOpenAIFetch(keyCandidates[attempt]!);
+        if (response.ok) {
+          if (lastErrorResponse) {
+            try {
+              await lastErrorResponse.body?.cancel();
+            } catch (cancelErr) {
+              // Ignore body cancellation failure
+            }
+            lastErrorResponse = null;
+          }
+          upstreamResponse = response;
+          responseResolved = true;
+          break providerLoop;
+        }
+        if (!isRetryableStatus(response.status)) {
+          if (lastErrorResponse) {
+            try {
+              await lastErrorResponse.body?.cancel();
+            } catch (cancelErr) {
+              // Ignore body cancellation failure
+            }
+          }
+          lastErrorResponse = response;
+          break providerLoop;
+        }
         if (lastErrorResponse) {
           try {
             await lastErrorResponse.body?.cancel();
           } catch (cancelErr) {
-            // Ignore body cancellation failure
+            // Ignore body cancellation failure before failover
           }
         }
         lastErrorResponse = response;
-        break providerLoop;
+        lastAttemptError = null;
+      } catch (err: any) {
+        lastAttemptError = err;
+        if (controller.signal.aborted) break providerLoop;
       }
-      if (lastErrorResponse) {
-        try {
-          await lastErrorResponse.body?.cancel();
-        } catch (cancelErr) {
-          // Ignore body cancellation failure before failover
-        }
-      }
-      lastErrorResponse = response;
-      lastAttemptError = null;
-    } catch (err: any) {
-      lastAttemptError = err;
-      if (controller.signal.aborted) break providerLoop;
     }
   }
-}
 
-if (!responseResolved) {
-  if (lastErrorResponse) {
-    upstreamResponse = lastErrorResponse;
-  } else {
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-    finishActive();
-    const isTimeout = controller.signal.aborted && timeoutSeconds > 0;
-    const durationMs = Math.round(performance.now() - startTime);
-    const statusCode = isTimeout ? 504 : 502;
-    const errorMsg = isTimeout
-      ? `Gateway timeout: Request duration exceeded configured limit of ${timeoutSeconds}s.`
-      : (lastAttemptError?.message || "Failed to reach upstream provider");
+  if (!responseResolved) {
+    if (lastErrorResponse) {
+      upstreamResponse = lastErrorResponse;
+    } else {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      finishActive();
+      const isTimeout = controller.signal.aborted && timeoutSeconds > 0;
+      const durationMs = Math.round(performance.now() - startTime);
+      const statusCode = isTimeout ? 504 : 502;
+      const errorMsg = isTimeout
+        ? `Gateway timeout: Request duration exceeded configured limit of ${timeoutSeconds}s.`
+        : lastAttemptError?.message || "Failed to reach upstream provider";
 
-    recordTelemetry({
-      clientKeyId: clientKey?.id,
-      clientKeyName: clientKey?.name,
-      upstreamKeyId: upstream.id,
-      provider: "openai",
-      endpoint: "/v1/chat/completions",
-      model,
-      promptTokens: 0,
-      completionTokens: 0,
-      cachedTokens: 0,
-      totalTokens: 0,
-      statusCode,
-      durationMs,
-      isStreaming: isStream,
-      errorMessage: errorMsg,
-    });
+      void recordTelemetry({
+        clientKeyId: clientKey?.id,
+        clientKeyName: clientKey?.name,
+        upstreamKeyId: upstream.id,
+        provider: "openai",
+        endpoint: "/v1/chat/completions",
+        model,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        statusCode,
+        durationMs,
+        isStreaming: isStream,
+        errorMessage: errorMsg,
+      });
 
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: errorMsg,
-          type: isTimeout ? "timeout_error" : "gateway_error",
-          code: isTimeout ? "gateway_timeout" : undefined,
-        },
-      }),
-      { status: statusCode, headers: { "Content-Type": "application/json" } }
-    );
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: errorMsg,
+            type: isTimeout ? "timeout_error" : "gateway_error",
+            code: isTimeout ? "gateway_timeout" : undefined,
+          },
+        }),
+        { status: statusCode, headers: { "Content-Type": "application/json" } },
+      );
+    }
   }
-}
 
   // Handle upstream error
   if (!upstreamResponse.ok) {
@@ -599,7 +675,7 @@ if (!responseResolved) {
     finishActive();
     const errorText = await upstreamResponse.text();
     const durationMs = Math.round(performance.now() - startTime);
-    recordTelemetry({
+    void recordTelemetry({
       clientKeyId: clientKey?.id,
       clientKeyName: clientKey?.name,
       upstreamKeyId: upstream.id,
@@ -640,7 +716,9 @@ if (!responseResolved) {
         }
       }
       responseData = {
-        id: responseData.id ? `chatcmpl-${responseData.id}` : `chatcmpl-${Date.now()}`,
+        id: responseData.id
+          ? `chatcmpl-${responseData.id}`
+          : `chatcmpl-${Date.now()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model,
@@ -654,7 +732,9 @@ if (!responseResolved) {
         usage: {
           prompt_tokens: responseData.usage?.input_tokens || 0,
           completion_tokens: responseData.usage?.output_tokens || 0,
-          total_tokens: (responseData.usage?.input_tokens || 0) + (responseData.usage?.output_tokens || 0),
+          total_tokens:
+            (responseData.usage?.input_tokens || 0) +
+            (responseData.usage?.output_tokens || 0),
         },
       };
     }
@@ -666,7 +746,7 @@ if (!responseResolved) {
       usage.prompt_tokens_details?.cached_tokens || usage.cached_tokens || 0;
     const totalTokens = usage.total_tokens || promptTokens + completionTokens;
 
-    recordTelemetry({
+    void recordTelemetry({
       clientKeyId: clientKey?.id,
       clientKeyName: clientKey?.name,
       upstreamKeyId: upstream.id,
@@ -683,18 +763,18 @@ if (!responseResolved) {
     });
 
     if (clientKey && totalTokens > 0) {
-      incrementClientKeyTokens(clientKey.id, totalTokens);
+      void incrementClientKeyTokens(clientKey.id, totalTokens);
     }
 
     if (opt.cacheEnabled && cacheKey) {
-      setCachedResponse(
+      void setCachedResponse(
         cacheKey,
         "openai",
         model,
         responseData,
         promptTokens,
         completionTokens,
-        opt.cacheTtlSeconds
+        opt.cacheTtlSeconds,
       );
     }
 
@@ -742,17 +822,31 @@ if (!responseResolved) {
               }
               try {
                 const parsed = JSON.parse(dataStr);
-                if (parsed.type === "response.output_text.delta" && typeof parsed.delta === "string") {
+                if (
+                  parsed.type === "response.output_text.delta" &&
+                  typeof parsed.delta === "string"
+                ) {
                   const openaiChunk = {
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
                     model,
-                    choices: [{ index: 0, delta: { content: parsed.delta }, finish_reason: null }],
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: parsed.delta },
+                        finish_reason: null,
+                      },
+                    ],
                   };
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
+                  controller.enqueue(
+                    encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`),
+                  );
                   estimatedTokens += 1;
-                } else if (parsed.type === "response.completed" || parsed.type === "response.done") {
+                } else if (
+                  parsed.type === "response.completed" ||
+                  parsed.type === "response.done"
+                ) {
                   const finalChunk = {
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
@@ -760,10 +854,16 @@ if (!responseResolved) {
                     model,
                     choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
                   };
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\ndata: [DONE]\n\n`));
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify(finalChunk)}\n\ndata: [DONE]\n\n`,
+                    ),
+                  );
                   if (parsed.response?.usage) {
-                    promptTokens = parsed.response.usage.input_tokens || promptTokens;
-                    completionTokens = parsed.response.usage.output_tokens || completionTokens;
+                    promptTokens =
+                      parsed.response.usage.input_tokens || promptTokens;
+                    completionTokens =
+                      parsed.response.usage.output_tokens || completionTokens;
                     totalTokens = promptTokens + completionTokens;
                   }
                 }
@@ -812,7 +912,10 @@ if (!responseResolved) {
         totalTokens = completionTokens;
       }
 
-      recordTelemetry({
+      // `flush` is a stream callback and cannot become async without deferring
+      // the flush, so these writes are started and left to run. They are safe to
+      // leave in flight because each one handles its own failure.
+      void recordTelemetry({
         clientKeyId: clientKey?.id,
         clientKeyName: clientKey?.name,
         upstreamKeyId: upstream.id,
@@ -830,7 +933,7 @@ if (!responseResolved) {
 
       const finalTokens = totalTokens || promptTokens + completionTokens;
       if (clientKey && finalTokens > 0) {
-        incrementClientKeyTokens(clientKey.id, finalTokens);
+        void incrementClientKeyTokens(clientKey.id, finalTokens);
       }
     },
     cancel(reason?: any) {
@@ -842,7 +945,7 @@ if (!responseResolved) {
   const responseHeaders = new Headers();
   responseHeaders.set(
     "Content-Type",
-    upstreamResponse.headers.get("content-type") || "text/event-stream"
+    upstreamResponse.headers.get("content-type") || "text/event-stream",
   );
   responseHeaders.set("Cache-Control", "no-cache");
   responseHeaders.set("Connection", "keep-alive");
@@ -859,55 +962,67 @@ export async function proxyAnthropicMessages(
   reqHeaders: Headers,
   body: any,
   clientKey: ClientKey | null,
-  clientSignal?: AbortSignal
+  clientSignal?: AbortSignal,
 ): Promise<Response> {
   const startTime = performance.now();
-  const requestedModel = (body && typeof body === "object" ? body.model : "") || "unknown";
-const selection = selectUpstreamCandidates(
-  "anthropic",
-  requestedModel,
-  clientKey,
-  FAILOVER_MAX_PROVIDERS
-);
-const { upstreams: upstreamCandidates, blocked: selfLoopUpstreams } =
-  filterSelfReferencingUpstreams(selection.upstreams, reqHeaders);
+  const requestedModel =
+    (body && typeof body === "object" ? body.model : "") || "unknown";
+  const selection = await selectUpstreamCandidates(
+    "anthropic",
+    requestedModel,
+    clientKey,
+    FAILOVER_MAX_PROVIDERS,
+  );
+  const { upstreams: upstreamCandidates, blocked: selfLoopUpstreams } =
+    filterSelfReferencingUpstreams(selection.upstreams, reqHeaders);
 
-if (upstreamCandidates.length === 0) {
-  if (selfLoopUpstreams.length > 0) {
+  if (upstreamCandidates.length === 0) {
+    if (selfLoopUpstreams.length > 0) {
+      return new Response(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: "router_error",
+            message:
+              "Upstream provider points back to Neko-Router's own endpoint (routing loop detected). Change its Base URL to a real upstream provider.",
+          },
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    const isForbidden = selection.error === "no_allowed_providers";
+    const isModelDisabled = selection.error === "model_not_enabled";
     return new Response(
       JSON.stringify({
         type: "error",
         error: {
-          type: "router_error",
+          type: isForbidden
+            ? "permission_error"
+            : isModelDisabled
+              ? "invalid_request_error"
+              : "router_error",
           message:
-            "Upstream provider points back to Neko-Router's own endpoint (routing loop detected). Change its Base URL to a real upstream provider.",
+            selection.message ||
+            (isModelDisabled
+              ? `Model '${requestedModel}' is not enabled on any active Anthropic upstream provider. Enable it in Upstream Settings.`
+              : "No active Anthropic upstream key configured in Neko-Router"),
         },
       }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+      {
+        status: isForbidden ? 403 : isModelDisabled ? 400 : 503,
+        headers: { "Content-Type": "application/json" },
+      },
     );
   }
-  const isForbidden = selection.error === "no_allowed_providers";
-  const isModelDisabled = selection.error === "model_not_enabled";
-  return new Response(
-    JSON.stringify({
-      type: "error",
-      error: {
-        type: isForbidden ? "permission_error" : isModelDisabled ? "invalid_request_error" : "router_error",
-        message:
-          selection.message ||
-          (isModelDisabled
-            ? `Model '${requestedModel}' is not enabled on any active Anthropic upstream provider. Enable it in Upstream Settings.`
-            : "No active Anthropic upstream key configured in Neko-Router"),
-      },
-    }),
-    { status: isForbidden ? 403 : isModelDisabled ? 400 : 503, headers: { "Content-Type": "application/json" } }
-  );
-}
 
   let upstream: UpstreamKey = upstreamCandidates[0]!;
 
   if (clientKey) {
-    if (clientKey.tokenLimit !== null && clientKey.tokenLimit !== undefined && clientKey.tokenLimit > 0) {
+    if (
+      clientKey.tokenLimit !== null &&
+      clientKey.tokenLimit !== undefined &&
+      clientKey.tokenLimit > 0
+    ) {
       if ((clientKey.usedTokens || 0) >= clientKey.tokenLimit) {
         return new Response(
           JSON.stringify({
@@ -917,12 +1032,15 @@ if (upstreamCandidates.length === 0) {
               message: `Token quota exceeded. Your key has consumed ${(clientKey.usedTokens || 0).toLocaleString()} of ${clientKey.tokenLimit.toLocaleString()} allocated tokens.`,
             },
           }),
-          { status: 429, headers: { "Content-Type": "application/json" } }
+          { status: 429, headers: { "Content-Type": "application/json" } },
         );
       }
     }
 
-    if (clientKey.rateLimit && !checkClientRateLimit(clientKey.id, clientKey.rateLimit)) {
+    if (
+      clientKey.rateLimit &&
+      !checkClientRateLimit(clientKey.id, clientKey.rateLimit)
+    ) {
       return new Response(
         JSON.stringify({
           type: "error",
@@ -931,20 +1049,31 @@ if (upstreamCandidates.length === 0) {
             message: `Rate limit exceeded. Key is restricted to ${clientKey.rateLimit} requests per minute.`,
           },
         }),
-        { status: 429, headers: { "Content-Type": "application/json" } }
+        { status: 429, headers: { "Content-Type": "application/json" } },
       );
     }
   }
 
-  const opt = getOptimizationSettings();
+  const opt = getOptimizationSettingsSync();
   const optimizedBody = optimizeRequestBody(body, "anthropic");
 
   // Normalize model name for upstream: if provider prefix was sent (e.g. "anthropic/claude-3-5-sonnet"), strip it unless custom gateway
-  if (optimizedBody && typeof optimizedBody.model === "string" && optimizedBody.model.includes("/")) {
-    const isCustomGateway = upstream.baseUrl && (upstream.baseUrl.includes("openrouter") || upstream.baseUrl.includes("together") || upstream.baseUrl.includes("groq"));
+  if (
+    optimizedBody &&
+    typeof optimizedBody.model === "string" &&
+    optimizedBody.model.includes("/")
+  ) {
+    const isCustomGateway =
+      upstream.baseUrl &&
+      (upstream.baseUrl.includes("openrouter") ||
+        upstream.baseUrl.includes("together") ||
+        upstream.baseUrl.includes("groq"));
     if (!isCustomGateway) {
       const parts = optimizedBody.model.split("/");
-      if (parts[0].toLowerCase() === "anthropic" || parts[0].toLowerCase() === upstream.provider.toLowerCase()) {
+      if (
+        parts[0].toLowerCase() === "anthropic" ||
+        parts[0].toLowerCase() === upstream.provider.toLowerCase()
+      ) {
         optimizedBody.model = parts.slice(1).join("/");
       }
     }
@@ -975,11 +1104,20 @@ if (upstreamCandidates.length === 0) {
         upstreamBaseUrl: getBaseUrl(upstream),
         body: optimizedBody,
       });
-      const cached = getCachedResponse(cacheKey);
+      const cached = await getCachedResponse(cacheKey);
       if (cached) {
         finishActive();
-        const durationMs = Math.max(1, Math.round(performance.now() - startTime));
-        recordTelemetry({
+        const durationMs = Math.max(
+          1,
+          Math.round(performance.now() - startTime),
+        );
+        // Usage accounting is deliberately not awaited: it must not delay or
+        // fail the response. This is now genuinely concurrent rather than
+        // merely unawaited — under SQLite the write completed before this line
+        // returned, so the `void` was cosmetic. `recordTelemetry`,
+        // `incrementClientKeyTokens` and `setCachedResponse` each catch and log
+        // their own errors, so no rejection escapes.
+        void recordTelemetry({
           clientKeyId: clientKey?.id,
           clientKeyName: clientKey?.name,
           upstreamKeyId: upstream.id,
@@ -996,7 +1134,7 @@ if (upstreamCandidates.length === 0) {
         });
 
         if (clientKey && cached.completionTokens > 0) {
-          incrementClientKeyTokens(clientKey.id, cached.completionTokens);
+          void incrementClientKeyTokens(clientKey.id, cached.completionTokens);
         }
 
         if (isStream) {
@@ -1045,7 +1183,7 @@ if (upstreamCandidates.length === 0) {
             headers: {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
-              "Connection": "keep-alive",
+              Connection: "keep-alive",
               "X-Cache-Status": "HIT",
             },
           });
@@ -1066,18 +1204,18 @@ if (upstreamCandidates.length === 0) {
 
   let upstreamUrl = `${getBaseUrl(upstream)}/v1/messages`;
 
-const buildAnthropicHeaders = (apiKey: string): Record<string, string> => {
-  const headerMap: Record<string, string> = {
-    "Content-Type": "application/json",
-    "x-api-key": apiKey,
-    "anthropic-version": reqHeaders.get("anthropic-version") || "2023-06-01",
+  const buildAnthropicHeaders = (apiKey: string): Record<string, string> => {
+    const headerMap: Record<string, string> = {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": reqHeaders.get("anthropic-version") || "2023-06-01",
+    };
+    const anthropicBeta = reqHeaders.get("anthropic-beta");
+    if (anthropicBeta) {
+      headerMap["anthropic-beta"] = anthropicBeta;
+    }
+    return headerMap;
   };
-  const anthropicBeta = reqHeaders.get("anthropic-beta");
-  if (anthropicBeta) {
-    headerMap["anthropic-beta"] = anthropicBeta;
-  }
-  return headerMap;
-};
 
   const timeoutSeconds = Number(opt.requestTimeoutSeconds) || 0;
   const controller = new AbortController();
@@ -1101,116 +1239,116 @@ const buildAnthropicHeaders = (apiKey: string): Record<string, string> => {
           controller.abort();
           finishActive();
         },
-        { once: true }
+        { once: true },
       );
     }
   }
 
-let upstreamResponse!: Response;
-let responseResolved = false;
-let lastAttemptError: any = null;
-let lastErrorResponse: Response | null = null;
+  let upstreamResponse!: Response;
+  let responseResolved = false;
+  let lastAttemptError: any = null;
+  let lastErrorResponse: Response | null = null;
 
-providerLoop: for (const candidate of upstreamCandidates) {
-  upstream = candidate;
-  finishActive.setUpstream(candidate.id);
-  upstreamUrl = `${getBaseUrl(candidate)}/v1/messages`;
+  providerLoop: for (const candidate of upstreamCandidates) {
+    upstream = candidate;
+    finishActive.setUpstream(candidate.id);
+    upstreamUrl = `${getBaseUrl(candidate)}/v1/messages`;
 
-  const keyCandidates = buildFailoverKeyCandidates(
-    getApiKeyForUpstream(candidate),
-    getActiveUpstreamKeyEntries(candidate)
-  );
+    const keyCandidates = buildFailoverKeyCandidates(
+      getApiKeyForUpstream(candidate),
+      getActiveUpstreamKeyEntries(candidate),
+    );
 
-  for (let attempt = 0; attempt < keyCandidates.length; attempt++) {
-    try {
-      const response = await fetchUpstream(upstreamUrl, {
-        method: "POST",
-        headers: buildAnthropicHeaders(keyCandidates[attempt]!),
-        body: JSON.stringify(optimizedBody),
-        signal: controller.signal,
-      });
-      if (response.ok) {
-        if (lastErrorResponse) {
-          try {
-            await lastErrorResponse.body?.cancel();
-          } catch (cancelErr) {
-            // Ignore body cancellation failure
+    for (let attempt = 0; attempt < keyCandidates.length; attempt++) {
+      try {
+        const response = await fetchUpstream(upstreamUrl, {
+          method: "POST",
+          headers: buildAnthropicHeaders(keyCandidates[attempt]!),
+          body: JSON.stringify(optimizedBody),
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          if (lastErrorResponse) {
+            try {
+              await lastErrorResponse.body?.cancel();
+            } catch (cancelErr) {
+              // Ignore body cancellation failure
+            }
+            lastErrorResponse = null;
           }
-          lastErrorResponse = null;
+          upstreamResponse = response;
+          responseResolved = true;
+          break providerLoop;
         }
-        upstreamResponse = response;
-        responseResolved = true;
-        break providerLoop;
-      }
-      if (!isRetryableStatus(response.status)) {
+        if (!isRetryableStatus(response.status)) {
+          if (lastErrorResponse) {
+            try {
+              await lastErrorResponse.body?.cancel();
+            } catch (cancelErr) {
+              // Ignore body cancellation failure
+            }
+          }
+          lastErrorResponse = response;
+          break providerLoop;
+        }
         if (lastErrorResponse) {
           try {
             await lastErrorResponse.body?.cancel();
           } catch (cancelErr) {
-            // Ignore body cancellation failure
+            // Ignore body cancellation failure before failover
           }
         }
         lastErrorResponse = response;
-        break providerLoop;
+        lastAttemptError = null;
+      } catch (err: any) {
+        lastAttemptError = err;
+        if (controller.signal.aborted) break providerLoop;
       }
-      if (lastErrorResponse) {
-        try {
-          await lastErrorResponse.body?.cancel();
-        } catch (cancelErr) {
-          // Ignore body cancellation failure before failover
-        }
-      }
-      lastErrorResponse = response;
-      lastAttemptError = null;
-    } catch (err: any) {
-      lastAttemptError = err;
-      if (controller.signal.aborted) break providerLoop;
     }
   }
-}
 
-if (!responseResolved) {
-  if (lastErrorResponse) {
-    upstreamResponse = lastErrorResponse;
-  } else {
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-    finishActive();
-    const isTimeout = controller.signal.aborted && timeoutSeconds > 0;
-    const durationMs = Math.round(performance.now() - startTime);
-    const statusCode = isTimeout ? 504 : 502;
-    const errorMsg = isTimeout
-      ? `Gateway timeout: Request duration exceeded configured limit of ${timeoutSeconds}s.`
-      : (lastAttemptError?.message || "Failed to reach Anthropic upstream");
+  if (!responseResolved) {
+    if (lastErrorResponse) {
+      upstreamResponse = lastErrorResponse;
+    } else {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      finishActive();
+      const isTimeout = controller.signal.aborted && timeoutSeconds > 0;
+      const durationMs = Math.round(performance.now() - startTime);
+      const statusCode = isTimeout ? 504 : 502;
+      const errorMsg = isTimeout
+        ? `Gateway timeout: Request duration exceeded configured limit of ${timeoutSeconds}s.`
+        : lastAttemptError?.message || "Failed to reach Anthropic upstream";
 
-    recordTelemetry({
-      clientKeyId: clientKey?.id,
-      clientKeyName: clientKey?.name,
-      upstreamKeyId: upstream.id,
-      provider: "anthropic",
-      endpoint: "/v1/messages",
-      model,
-      promptTokens: 0,
-      completionTokens: 0,
-      cachedTokens: 0,
-      totalTokens: 0,
-      statusCode,
-      durationMs,
-      isStreaming: isStream,
-      errorMessage: errorMsg,
-    });
+      void recordTelemetry({
+        clientKeyId: clientKey?.id,
+        clientKeyName: clientKey?.name,
+        upstreamKeyId: upstream.id,
+        provider: "anthropic",
+        endpoint: "/v1/messages",
+        model,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        statusCode,
+        durationMs,
+        isStreaming: isStream,
+        errorMessage: errorMsg,
+      });
 
-    return new Response(
-      JSON.stringify({
-        type: "error",
-        error: {
-          type: isTimeout ? "timeout_error" : "gateway_error",
-          message: errorMsg,
-        },
-      }),
-      { status: statusCode, headers: { "Content-Type": "application/json" } }
-    );
+      return new Response(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: isTimeout ? "timeout_error" : "gateway_error",
+            message: errorMsg,
+          },
+        }),
+        { status: statusCode, headers: { "Content-Type": "application/json" } },
+      );
+    }
   }
-}
 
   // Handle upstream error
   if (!upstreamResponse.ok) {
@@ -1218,7 +1356,7 @@ if (!responseResolved) {
     finishActive();
     const errorText = await upstreamResponse.text();
     const durationMs = Math.round(performance.now() - startTime);
-    recordTelemetry({
+    void recordTelemetry({
       clientKeyId: clientKey?.id,
       clientKeyName: clientKey?.name,
       upstreamKeyId: upstream.id,
@@ -1256,7 +1394,7 @@ if (!responseResolved) {
     const cachedTokens = usage.cache_read_input_tokens || 0;
     const totalTokens = promptTokens + completionTokens;
 
-    recordTelemetry({
+    void recordTelemetry({
       clientKeyId: clientKey?.id,
       clientKeyName: clientKey?.name,
       upstreamKeyId: upstream.id,
@@ -1273,18 +1411,18 @@ if (!responseResolved) {
     });
 
     if (clientKey && totalTokens > 0) {
-      incrementClientKeyTokens(clientKey.id, totalTokens);
+      void incrementClientKeyTokens(clientKey.id, totalTokens);
     }
 
     if (opt.cacheEnabled && cacheKey) {
-      setCachedResponse(
+      void setCachedResponse(
         cacheKey,
         "anthropic",
         model,
         responseData,
         promptTokens,
         completionTokens,
-        opt.cacheTtlSeconds
+        opt.cacheTtlSeconds,
       );
     }
 
@@ -1327,8 +1465,12 @@ if (!responseResolved) {
             try {
               const parsed = JSON.parse(dataStr);
               if (currentEvent === "message_start" && parsed?.message?.usage) {
-                promptTokens = parsed.message.usage.input_tokens || promptTokens;
-                if (typeof parsed.message.usage.cache_read_input_tokens === "number") {
+                promptTokens =
+                  parsed.message.usage.input_tokens || promptTokens;
+                if (
+                  typeof parsed.message.usage.cache_read_input_tokens ===
+                  "number"
+                ) {
                   cachedTokens = parsed.message.usage.cache_read_input_tokens;
                 }
               } else if (
@@ -1350,7 +1492,9 @@ if (!responseResolved) {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       finishActive();
       const durationMs = Math.round(performance.now() - startTime);
-      recordTelemetry({
+      // See the note on the other `flush`: a stream callback cannot await
+      // without deferring the flush itself.
+      void recordTelemetry({
         clientKeyId: clientKey?.id,
         clientKeyName: clientKey?.name,
         upstreamKeyId: upstream.id,
@@ -1366,8 +1510,11 @@ if (!responseResolved) {
         isStreaming: true,
       });
 
-      if (clientKey && (promptTokens + completionTokens) > 0) {
-        incrementClientKeyTokens(clientKey.id, promptTokens + completionTokens);
+      if (clientKey && promptTokens + completionTokens > 0) {
+        void incrementClientKeyTokens(
+          clientKey.id,
+          promptTokens + completionTokens,
+        );
       }
     },
     cancel(reason?: any) {
@@ -1379,7 +1526,7 @@ if (!responseResolved) {
   const responseHeaders = new Headers();
   responseHeaders.set(
     "Content-Type",
-    upstreamResponse.headers.get("content-type") || "text/event-stream"
+    upstreamResponse.headers.get("content-type") || "text/event-stream",
   );
   responseHeaders.set("Cache-Control", "no-cache");
   responseHeaders.set("Connection", "keep-alive");
@@ -1395,7 +1542,10 @@ if (!responseResolved) {
 function getModelCapabilities(modelId: string) {
   const lower = modelId.toLowerCase();
   const isEmbedding = lower.includes("embedding");
-  const isAudio = lower.includes("whisper") || lower.includes("tts") || lower.includes("audio");
+  const isAudio =
+    lower.includes("whisper") ||
+    lower.includes("tts") ||
+    lower.includes("audio");
   const isImage = lower.includes("dall-e") || lower.includes("image");
   const isReasoning =
     lower.includes("o1") ||
@@ -1431,9 +1581,15 @@ function getModelCapabilities(modelId: string) {
 
 function getModelContextWindow(modelId: string): number {
   const lower = modelId.toLowerCase();
-  if (lower.includes("claude-3") || lower.includes("claude-3.5") || lower.includes("claude-3.7")) return 200000;
+  if (
+    lower.includes("claude-3") ||
+    lower.includes("claude-3.5") ||
+    lower.includes("claude-3.7")
+  )
+    return 200000;
   if (lower.includes("o1") || lower.includes("o3")) return 200000;
-  if (lower.includes("gemini-1.5") || lower.includes("gemini-2.0")) return 1000000;
+  if (lower.includes("gemini-1.5") || lower.includes("gemini-2.0"))
+    return 1000000;
   if (lower.includes("gpt-4o") || lower.includes("gpt-4-turbo")) return 128000;
   if (lower.includes("gpt-4-32k")) return 32768;
   if (lower.includes("gpt-4")) return 8192;
@@ -1458,7 +1614,9 @@ function getModelMaxTokens(modelId: string): number {
 function enrichModel(prefix: string, m: any, defaultCreated?: number) {
   const rawId = String(m.id || m.name || "").trim();
   // Strip any existing provider prefix to extract clean model id
-  const cleanId = rawId.includes("/") ? rawId.split("/").slice(1).join("/") : rawId;
+  const cleanId = rawId.includes("/")
+    ? rawId.split("/").slice(1).join("/")
+    : rawId;
   const fullId = prefix ? `${prefix}/${cleanId}` : cleanId;
 
   const created =
@@ -1467,8 +1625,13 @@ function enrichModel(prefix: string, m: any, defaultCreated?: number) {
       : defaultCreated || Math.floor(Date.now() / 1000);
 
   const capabilities = m.capabilities || getModelCapabilities(cleanId);
-  const contextWindow = m.context_window || m.contextWindow || getModelContextWindow(cleanId);
-  const maxTokens = m.max_tokens || m.maxTokens || m.max_output_tokens || getModelMaxTokens(cleanId);
+  const contextWindow =
+    m.context_window || m.contextWindow || getModelContextWindow(cleanId);
+  const maxTokens =
+    m.max_tokens ||
+    m.maxTokens ||
+    m.max_output_tokens ||
+    getModelMaxTokens(cleanId);
   const type = capabilities.embeddings ? "embeddings" : "chat";
 
   const modelObj: Record<string, any> = {
@@ -1477,7 +1640,9 @@ function enrichModel(prefix: string, m: any, defaultCreated?: number) {
     created,
     owned_by: "NekoRouter",
     name: m.name || cleanId,
-    description: m.description || `${cleanId} routed via Neko-Router${prefix ? ` (${prefix})` : ""}`,
+    description:
+      m.description ||
+      `${cleanId} routed via Neko-Router${prefix ? ` (${prefix})` : ""}`,
     provider: prefix || m.provider || "NekoRouter",
     type,
     context_window: contextWindow,
@@ -1522,9 +1687,9 @@ function enrichModel(prefix: string, m: any, defaultCreated?: number) {
 
 export async function proxyOpenAIModels(
   clientKey: ClientKey | null,
-  headers?: Headers
+  headers?: Headers,
 ): Promise<Response> {
-  const opt = getOptimizationSettings();
+  const opt = getOptimizationSettingsSync();
   const authHeader = headers?.get("Authorization");
   const xApiKey = headers?.get("x-api-key");
   const passedKey = authHeader?.startsWith("Bearer ")
@@ -1532,30 +1697,42 @@ export async function proxyOpenAIModels(
     : xApiKey?.trim();
 
   // Cari provider follow upstream / pass-through yang aktif
-  const followUpstream = db
-    .select()
-    .from(upstreamKeys)
-    .where(and(eq(upstreamKeys.followUpstream, 1), eq(upstreamKeys.isActive, 1)))
-    .get();
+  const followUpstream = await fetchOne(
+    db
+      .select()
+      .from(upstreamKeys)
+      .where(
+        and(eq(upstreamKeys.followUpstream, 1), eq(upstreamKeys.isActive, 1)),
+      ),
+  );
 
-  const allowedProviders = clientKey ? parseAllowedProviders(clientKey.allowedProviders) : [];
+  const allowedProviders = clientKey
+    ? parseAllowedProviders(clientKey.allowedProviders)
+    : [];
 
   // Tentukan apakah request ini adalah pass-through:
   // 1. Key memiliki flag isFollowUpstream = 1
   // 2. Key adalah 'bb-default'
   // 3. Key hanya mengizinkan follow upstream provider
   const isPassThrough = Boolean(
-    clientKey && (
-      clientKey.isFollowUpstream === 1 ||
+    clientKey &&
+    (clientKey.isFollowUpstream === 1 ||
       clientKey.key === "bb-default" ||
-      (followUpstream && allowedProviders.length > 0 && allowedProviders.every((id) => id === followUpstream.id || id === "up_bandelbanget_follow"))
-    )
+      (followUpstream &&
+        allowedProviders.length > 0 &&
+        allowedProviders.every(
+          (id) => id === followUpstream.id || id === "up_bandelbanget_follow",
+        ))),
   );
 
   // Jika pass-through: tampilkan 100% model langsung dari upstream
   if (isPassThrough && followUpstream) {
-    const targetBase = (followUpstream.baseUrl || "https://bandelbanget.xyz/v1").replace(/\/+$/, "");
-    const targetUrl = targetBase.endsWith("/v1") ? `${targetBase}/models` : `${targetBase}/v1/models`;
+    const targetBase = (
+      followUpstream.baseUrl || "https://bandelbanget.xyz/v1"
+    ).replace(/\/+$/, "");
+    const targetUrl = targetBase.endsWith("/v1")
+      ? `${targetBase}/models`
+      : `${targetBase}/v1/models`;
 
     // Forward the credential upstream only when it is the authenticated
     // client key. Gateway-issued sk-neko- keys must never be sent to a third
@@ -1600,7 +1777,10 @@ export async function proxyOpenAIModels(
           headers: { "Content-Type": "application/json" },
         });
       } else {
-        console.warn("Pass-through /models upstream responded with status", upstreamRes.status);
+        console.warn(
+          "Pass-through /models upstream responded with status",
+          upstreamRes.status,
+        );
       }
     } catch (err) {
       console.error("Failed to proxy /v1/models directly to upstream:", err);
@@ -1610,7 +1790,9 @@ export async function proxyOpenAIModels(
     try {
       const { fetchBandelBangetLiveModels } = await import("./bandelbanget");
       const liveModels = await fetchBandelBangetLiveModels();
-      const data = liveModels.map((m) => enrichModel("", { ...m, owned_by: "NekoRouter" }));
+      const data = liveModels.map((m) =>
+        enrichModel("", { ...m, owned_by: "NekoRouter" }),
+      );
       return new Response(JSON.stringify({ object: "list", data }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -1618,9 +1800,11 @@ export async function proxyOpenAIModels(
     } catch (e) {}
   }
 
-  const activeOpenAI = getActiveUpstreamKeys("openai");
-  const activeAnthropic = getActiveUpstreamKeys("anthropic");
-  const allActive = [...activeOpenAI, ...activeAnthropic].filter((u) => u.isActive);
+  const activeOpenAI = await getActiveUpstreamKeys("openai");
+  const activeAnthropic = await getActiveUpstreamKeys("anthropic");
+  const allActive = [...activeOpenAI, ...activeAnthropic].filter(
+    (u) => u.isActive,
+  );
 
   if (allActive.length === 0) {
     return new Response(JSON.stringify({ object: "list", data: [] }), {
@@ -1653,11 +1837,15 @@ export async function proxyOpenAIModels(
       // Jika salah satu upstream yang diizinkan adalah follow upstream, ambil live models 100%
       if (Boolean((upstream as any).followUpstream)) {
         try {
-          const { fetchBandelBangetLiveModels } = await import("./bandelbanget");
+          const { fetchBandelBangetLiveModels } =
+            await import("./bandelbanget");
           const liveModels = await fetchBandelBangetLiveModels();
           for (const lm of liveModels) {
             if (!enabledModelMap.has(lm.id)) {
-              const enriched = enrichModel("", { ...lm, owned_by: "NekoRouter" });
+              const enriched = enrichModel("", {
+                ...lm,
+                owned_by: "NekoRouter",
+              });
               enabledModelMap.set(lm.id, enriched);
             }
           }
@@ -1665,7 +1853,8 @@ export async function proxyOpenAIModels(
         continue;
       }
 
-      const rawPrefix = opt.modelPrefixEnabled && upstream.prefix ? upstream.prefix.trim() : "";
+      const rawPrefix =
+        opt.modelPrefixEnabled && upstream.prefix ? upstream.prefix.trim() : "";
       const models = parseUpstreamModels(upstream.models);
       for (const m of models) {
         // HANYA model yang diaktifkan (enabled === true)
@@ -1687,7 +1876,8 @@ export async function proxyOpenAIModels(
   for (const upstream of allActive) {
     if (Boolean((upstream as any).followUpstream)) continue;
 
-    const rawPrefix = opt.modelPrefixEnabled && upstream.prefix ? upstream.prefix.trim() : "";
+    const rawPrefix =
+      opt.modelPrefixEnabled && upstream.prefix ? upstream.prefix.trim() : "";
     const models = parseUpstreamModels(upstream.models);
     for (const m of models) {
       if (m.enabled) {

@@ -2,20 +2,38 @@ import { Elysia } from "elysia";
 import { cors } from "@elysiajs/cors";
 import { swagger } from "@elysiajs/swagger";
 import { initDatabase } from "./db";
-import { authRoutes } from "./routes/auth";
-import { keysRoutes } from "./routes/keys";
-import { routerApiKeysRoutes } from "./routes/api-keys";
-import { upstreamRoutes } from "./routes/upstreams";
-import { telemetryRoutes } from "./routes/telemetry";
-import { adminRoutes } from "./routes/admin";
-import { proxyRoutes } from "./routes/proxy";
-import { apiProvidersRoutes } from "./routes/api-providers";
 import { existsSync, watch } from "fs";
 import { join } from "path";
 import { webHandler, htmlTemplate, bundleFrontend } from "./web/handler";
 
-// Initialize database schema and default PIN
+// Connect to the database and create the schema BEFORE any route module is
+// evaluated. Route modules are loaded with dynamic import() below rather than
+// static import() at the top of this file, because ES module imports are
+// hoisted: a static import would evaluate them first, and they read the JWT
+// signing secret at evaluation time (the @elysiajs/jwt plugin captures it when
+// constructed). With a networked engine (Postgres/MySQL) the connection is
+// asynchronous, so that ordering guarantee cannot be left to chance.
 await initDatabase();
+
+const [
+  { authRoutes },
+  { keysRoutes },
+  { routerApiKeysRoutes },
+  { upstreamRoutes },
+  { telemetryRoutes },
+  { adminRoutes },
+  { proxyRoutes },
+  { apiProvidersRoutes },
+] = await Promise.all([
+  import("./routes/auth"),
+  import("./routes/keys"),
+  import("./routes/api-keys"),
+  import("./routes/upstreams"),
+  import("./routes/telemetry"),
+  import("./routes/admin"),
+  import("./routes/proxy"),
+  import("./routes/api-providers"),
+]);
 
 // Pre-bundle frontend in memory on startup (background)
 bundleFrontend().catch((err) => console.error("[Frontend] Bundle preheat error:", err));

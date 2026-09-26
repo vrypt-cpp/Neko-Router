@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import { db, sqlite } from "../db";
+import { db, transaction } from "../db";
 import { apiKeys, clientKeys } from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { eq, desc, sql } from "drizzle-orm";
@@ -24,8 +24,8 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
       return { error: "Unauthorized access to router integration API keys" };
     }
   })
-  .get("/", () => {
-    const list = db
+  .get("/", async () => {
+    const list = await db
       .select({
         id: apiKeys.id,
         name: apiKeys.name,
@@ -37,11 +37,10 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
         secretKeysCount: sql<number>`(SELECT count(*) FROM client_keys WHERE client_keys.api_key_id = api_keys.id)`,
       })
       .from(apiKeys)
-      .orderBy(desc(apiKeys.createdAt))
-      .all();
+      .orderBy(desc(apiKeys.createdAt));
 
     return {
-      keys: list.map((k) => ({
+      keys: list.map((k: any) => ({
         ...k,
         isActive: k.isActive === 1,
         secretKeysCount: Number(k.secretKeysCount || 0),
@@ -54,16 +53,18 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
   })
   .post(
     "/",
-    ({ body, set }) => {
+    async ({ body, set }) => {
       const { name, description, customKey } = body;
       const keyStr = generateApiKeyString(customKey);
 
       // Check duplicate
-      const existing = db
-        .select()
-        .from(apiKeys)
-        .where(eq(apiKeys.key, keyStr))
-        .get();
+      const existing = (
+        await db
+          .select()
+          .from(apiKeys)
+          .where(eq(apiKeys.key, keyStr))
+          .limit(1)
+      )[0];
 
       if (existing) {
         set.status = 400;
@@ -73,17 +74,15 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
       const id = "ak_" + crypto.randomUUID().replace(/-/g, "");
       const now = Date.now();
 
-      db.insert(apiKeys)
-        .values({
-          id,
-          name: name.trim(),
-          key: keyStr,
-          description: description?.trim() || null,
-          isActive: 1,
-          createdAt: now,
-          lastUsedAt: null,
-        })
-        .run();
+      await db.insert(apiKeys).values({
+        id,
+        name: name.trim(),
+        key: keyStr,
+        description: description?.trim() || null,
+        isActive: 1,
+        createdAt: now,
+        lastUsedAt: null,
+      });
 
       return {
         success: true,
@@ -109,27 +108,29 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
   )
   .patch(
     "/:id",
-    ({ params: { id }, body, set }) => {
-      const existing = db
-        .select()
-        .from(apiKeys)
-        .where(eq(apiKeys.id, id))
-        .get();
+    async ({ params: { id }, body, set }) => {
+      const existing = (
+        await db
+          .select()
+          .from(apiKeys)
+          .where(eq(apiKeys.id, id))
+          .limit(1)
+      )[0];
 
       if (!existing) {
         set.status = 404;
         return { error: "API Key not found" };
       }
 
-      const updateData: Partial<typeof apiKeys.$inferInsert> = {};
+      const updateData: Record<string, unknown> = {};
       if (body.name !== undefined) updateData.name = body.name.trim();
       if (body.description !== undefined) updateData.description = body.description ? body.description.trim() : null;
       if (body.isActive !== undefined) updateData.isActive = body.isActive ? 1 : 0;
 
-      db.update(apiKeys)
-        .set(updateData)
-        .where(eq(apiKeys.id, id))
-        .run();
+      await db
+        .update(apiKeys)
+        .set(updateData as never)
+        .where(eq(apiKeys.id, id));
 
       return { success: true };
     },
@@ -141,12 +142,14 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
       }),
     }
   )
-  .patch("/:id/toggle", ({ params: { id }, set }) => {
-    const existing = db
-      .select()
-      .from(apiKeys)
-      .where(eq(apiKeys.id, id))
-      .get();
+  .patch("/:id/toggle", async ({ params: { id }, set }) => {
+    const existing = (
+      await db
+        .select()
+        .from(apiKeys)
+        .where(eq(apiKeys.id, id))
+        .limit(1)
+    )[0];
 
     if (!existing) {
       set.status = 404;
@@ -154,21 +157,23 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
     }
 
     const nextState = existing.isActive ? 0 : 1;
-    db.update(apiKeys)
+    await db
+      .update(apiKeys)
       .set({ isActive: nextState })
-      .where(eq(apiKeys.id, id))
-      .run();
+      .where(eq(apiKeys.id, id));
 
     return { success: true, isActive: nextState === 1 };
   })
   .post(
     "/:id/rotate",
-    ({ params: { id }, body, set }) => {
-      const existing = db
-        .select()
-        .from(apiKeys)
-        .where(eq(apiKeys.id, id))
-        .get();
+    async ({ params: { id }, body, set }) => {
+      const existing = (
+        await db
+          .select()
+          .from(apiKeys)
+          .where(eq(apiKeys.id, id))
+          .limit(1)
+      )[0];
 
       if (!existing) {
         set.status = 404;
@@ -178,21 +183,23 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
       const customKey = body?.customKey;
       const newKeyStr = generateApiKeyString(customKey);
 
-      const duplicate = db
-        .select()
-        .from(apiKeys)
-        .where(eq(apiKeys.key, newKeyStr))
-        .get();
+      const duplicate = (
+        await db
+          .select()
+          .from(apiKeys)
+          .where(eq(apiKeys.key, newKeyStr))
+          .limit(1)
+      )[0];
 
       if (duplicate && duplicate.id !== id) {
         set.status = 400;
         return { error: "API Key already exists" };
       }
 
-      db.update(apiKeys)
+      await db
+        .update(apiKeys)
         .set({ key: newKeyStr })
-        .where(eq(apiKeys.id, id))
-        .run();
+        .where(eq(apiKeys.id, id));
 
       const displayKey =
         newKeyStr.length > 18
@@ -216,12 +223,14 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
   )
   .post(
     "/:id/regenerate",
-    ({ params: { id }, body, set }) => {
-      const existing = db
-        .select()
-        .from(apiKeys)
-        .where(eq(apiKeys.id, id))
-        .get();
+    async ({ params: { id }, body, set }) => {
+      const existing = (
+        await db
+          .select()
+          .from(apiKeys)
+          .where(eq(apiKeys.id, id))
+          .limit(1)
+      )[0];
 
       if (!existing) {
         set.status = 404;
@@ -231,21 +240,23 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
       const customKey = body?.customKey;
       const newKeyStr = generateApiKeyString(customKey);
 
-      const duplicate = db
-        .select()
-        .from(apiKeys)
-        .where(eq(apiKeys.key, newKeyStr))
-        .get();
+      const duplicate = (
+        await db
+          .select()
+          .from(apiKeys)
+          .where(eq(apiKeys.key, newKeyStr))
+          .limit(1)
+      )[0];
 
       if (duplicate && duplicate.id !== id) {
         set.status = 400;
         return { error: "API Key already exists" };
       }
 
-      db.update(apiKeys)
+      await db
+        .update(apiKeys)
         .set({ key: newKeyStr })
-        .where(eq(apiKeys.id, id))
-        .run();
+        .where(eq(apiKeys.id, id));
 
       const displayKey =
         newKeyStr.length > 18
@@ -269,16 +280,23 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
   )
   .post(
     "/batch-delete",
-    ({ body, set }) => {
+    async ({ body, set }) => {
       const { ids } = body;
       if (!Array.isArray(ids) || ids.length === 0) {
         set.status = 400;
         return { error: "No key IDs provided" };
       }
-      for (const id of ids) {
-        sqlite.run("UPDATE client_keys SET api_key_id = NULL WHERE api_key_id = ?", [id]);
-        db.delete(apiKeys).where(eq(apiKeys.id, id)).run();
-      }
+      // Unlinking and deleting happen in one transaction so a failure cannot
+      // leave secret keys pointing at an API key that no longer exists.
+      await transaction(async () => {
+        for (const id of ids) {
+          await db
+            .update(clientKeys)
+            .set({ apiKeyId: null })
+            .where(eq(clientKeys.apiKeyId, id));
+          await db.delete(apiKeys).where(eq(apiKeys.id, id));
+        }
+      });
       return { success: true, deletedCount: ids.length };
     },
     {
@@ -287,21 +305,21 @@ export const routerApiKeysRoutes = new Elysia({ prefix: "/api/router-keys" })
       }),
     }
   )
-  .delete("/:id", ({ params: { id }, set }) => {
-    const existing = db
-      .select()
-      .from(apiKeys)
-      .where(eq(apiKeys.id, id))
-      .get();
+  .delete("/:id", async ({ params: { id }, set }) => {
+    const existing = (
+      await db.select().from(apiKeys).where(eq(apiKeys.id, id)).limit(1)
+    )[0];
 
     if (!existing) {
       set.status = 404;
       return { error: "API Key not found" };
     }
 
-    // Unlink any secret keys that belonged to this API key
-    sqlite.run("UPDATE client_keys SET api_key_id = NULL WHERE api_key_id = ?", [id]);
+    await transaction(async () => {
+      // Unlink any secret keys that belonged to this API key
+      await db.update(clientKeys).set({ apiKeyId: null }).where(eq(clientKeys.apiKeyId, id));
+      await db.delete(apiKeys).where(eq(apiKeys.id, id));
+    });
 
-    db.delete(apiKeys).where(eq(apiKeys.id, id)).run();
     return { success: true };
   });

@@ -1,4 +1,4 @@
-import { db } from "../db";
+import { db, fetchAll } from "../db";
 import { upstreamKeys, type UpstreamKey } from "../db/schema";
 import { eq, and } from "drizzle-orm";
 
@@ -136,10 +136,10 @@ export function getActiveUpstreamKeyEntries(
   return entries;
 }
 
-export function getActiveUpstreamKeys(
+export async function getActiveUpstreamKeys(
   provider: "openai" | "anthropic"
-): UpstreamKey[] {
-  const list = db
+): Promise<UpstreamKey[]> {
+  const list = await fetchAll(db
     .select()
     .from(upstreamKeys)
     .where(
@@ -147,8 +147,7 @@ export function getActiveUpstreamKeys(
         eq(upstreamKeys.provider, provider),
         eq(upstreamKeys.isActive, 1)
       )
-    )
-    .all();
+    ));
 
   // Filter out any upstream where ALL individual keys are toggled OFF
   return list.filter((upstream) => {
@@ -299,13 +298,13 @@ export interface UpstreamCandidatesResult {
 // Returns the ordered list of eligible providers for a request.
 // The first item is the round-robin (or highest-weight) primary provider, followed
 // by the remaining eligible providers in random order for failover.
-export function selectUpstreamCandidates(
+export async function selectUpstreamCandidates(
   provider: "openai" | "anthropic",
   requestedModel?: string,
   clientKey?: { id: string; name: string; allowedProviders?: string | null; roundRobinProviders?: number } | null,
   maxProviders = 3
-): UpstreamCandidatesResult {
-  const allActive = getActiveUpstreamKeys(provider);
+): Promise<UpstreamCandidatesResult> {
+  const allActive = await getActiveUpstreamKeys(provider);
   if (!allActive || allActive.length === 0) {
     return {
       upstreams: [],
@@ -434,12 +433,12 @@ export function selectUpstreamCandidates(
   return { upstreams: candidates.slice(0, cap) };
 }
 
-export function selectUpstreamKey(
+export async function selectUpstreamKey(
   provider: "openai" | "anthropic",
   requestedModel?: string,
   clientKey?: { id: string; name: string; allowedProviders?: string | null; roundRobinProviders?: number } | null
-): UpstreamSelectionResult {
-  const result = selectUpstreamCandidates(provider, requestedModel, clientKey, 1);
+): Promise<UpstreamSelectionResult> {
+  const result = await selectUpstreamCandidates(provider, requestedModel, clientKey, 1);
   return {
     upstream: result.upstreams[0] ?? null,
     error: result.error,

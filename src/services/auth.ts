@@ -1,6 +1,6 @@
-import { sqlite, db } from "../db";
+import { db, getSetting, setSetting, getJwtSecretCached } from "../db";
 import { clientKeys, apiKeys, type ClientKey, type ApiKey } from "../db/schema";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 /**
  * Returns the JWT signing secret.
@@ -9,61 +9,55 @@ import { eq } from "drizzle-orm";
  * falling back to a hardcoded value. A predictable signing secret would let anyone
  * forge an admin session token, so a missing secret must never degrade silently.
  *
- * The secret is bootstrapped synchronously in src/db/index.ts (see ensureJwtSecretSync),
- * which is guaranteed to run before any route module reads this value.
+ * The value is read during `initDatabase()` and cached in memory, so this stays
+ * synchronous: `@elysiajs/jwt` requires the secret when the plugin is
+ * constructed, which happens while route modules are evaluated. That evaluation
+ * is deliberately ordered after database initialization in src/index.ts.
  */
 export function getJwtSecret(): string {
-  let row: { value: string } | null = null;
   try {
-    row = sqlite
-      .query("SELECT value FROM settings WHERE key = 'jwt_secret'")
-      .get() as { value: string } | null;
+    return getJwtSecretCached();
   } catch (e) {
     throw new Error(
-      "Unable to read the JWT secret from the database. Refusing to start with an insecure fallback."
+      "Unable to read the JWT secret from the database. Refusing to start with an insecure fallback.",
     );
   }
-
-  if (!row?.value) {
-    throw new Error(
-      "JWT secret is not initialized. Refusing to sign or verify tokens with a predictable secret."
-    );
-  }
-
-  return row.value;
 }
 
-export function isDefaultPin(): boolean {
+/**
+ * True while the deployment still uses the seeded PIN (123456).
+ *
+ * Fails closed on error: treating an unreadable flag as "default" is the
+ * safer direction, because the UI will then keep prompting the operator to
+ * change it rather than silently dropping the warning.
+ */
+export async function isDefaultPin(): Promise<boolean> {
   try {
-    const row = sqlite
-      .query("SELECT value FROM settings WHERE key = 'is_default_pin'")
-      .get() as { value: string } | null;
-    return row?.value === "1";
+    const value = await getSetting("is_default_pin");
+    return value === "1";
   } catch (e) {
     return true;
   }
 }
 
-export function getTurnstileConfig(): {
+export interface TurnstileConfig {
   siteKey: string;
   secretKey: string;
   enabled: boolean;
-} {
+}
+
+export async function getTurnstileConfig(): Promise<TurnstileConfig> {
   let siteKey = process.env.TURNSTILE_SITE_KEY || "";
   let secretKey = process.env.TURNSTILE_SECRET_KEY || "";
 
   try {
-    const siteRow = sqlite
-      .query("SELECT value FROM settings WHERE key = 'turnstile_site_key'")
-      .get() as { value: string } | null;
-    if (siteRow?.value) siteKey = siteRow.value;
+    const siteRow = await getSetting("turnstile_site_key");
+    if (siteRow) siteKey = siteRow;
 
-    const secretRow = sqlite
-      .query("SELECT value FROM settings WHERE key = 'turnstile_secret_key'")
-      .get() as { value: string } | null;
-    if (secretRow?.value) secretKey = secretRow.value;
+    const secretRow = await getSetting("turnstile_secret_key");
+    if (secretRow) secretKey = secretRow;
   } catch (e) {
-    // ignore
+    // Environment variables remain the fallback source.
   }
 
   const enabled = Boolean(siteKey.trim() && secretKey.trim());
@@ -72,9 +66,9 @@ export function getTurnstileConfig(): {
 
 export async function verifyTurnstileToken(
   token: string,
-  remoteIp?: string
+  remoteIp?: string,
 ): Promise<{ success: boolean; error?: string }> {
-  const { secretKey, enabled } = getTurnstileConfig();
+  const { secretKey, enabled } = await getTurnstileConfig();
   if (!enabled) {
     return { success: true };
   }
@@ -102,7 +96,7 @@ export async function verifyTurnstileToken(
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
         },
-      }
+      },
     );
 
     const data = (await res.json()) as {
@@ -130,11 +124,9 @@ export async function verifyTurnstileToken(
 
 export async function verifyPin(pin: string): Promise<boolean> {
   try {
-    const row = sqlite
-      .query("SELECT value FROM settings WHERE key = 'auth_pin_hash'")
-      .get() as { value: string } | null;
-    if (!row?.value) return false;
-    return await Bun.password.verify(pin, row.value);
+    const hash = await getSetting("auth_pin_hash");
+    if (!hash) return false;
+    return await Bun.password.verify(pin, hash);
   } catch (e) {
     console.error("Error verifying PIN:", e);
     return false;
@@ -143,7 +135,7 @@ export async function verifyPin(pin: string): Promise<boolean> {
 
 export async function changePin(
   currentPin: string,
-  newPin: string
+  newPin: string,
 ): Promise<{ success: boolean; error?: string }> {
   if (!newPin || newPin.length < 6) {
     return { success: false, error: "New PIN must be at least 6 characters" };
@@ -159,38 +151,30 @@ export async function changePin(
     cost: 10,
   });
 
-  const now = Date.now();
-  sqlite.run(
-    "UPDATE settings SET value = ?, updated_at = ? WHERE key = 'auth_pin_hash'",
-    [newHash, now]
-  );
-  sqlite.run(
-    "UPDATE settings SET value = '0', updated_at = ? WHERE key = 'is_default_pin'",
-    [now]
-  );
+  await setSetting("auth_pin_hash", newHash);
+  await setSetting("is_default_pin", "0");
 
   return { success: true };
 }
 
 export async function validateApiKey(
-  providedKey: string
+  providedKey: string,
 ): Promise<ApiKey | null> {
   if (!providedKey) return null;
-  const keyRecord = db
-    .select()
-    .from(apiKeys)
-    .where(eq(apiKeys.key, providedKey))
-    .get();
+  const keyRecord = (
+    await db.select().from(apiKeys).where(eq(apiKeys.key, providedKey)).limit(1)
+  )[0];
 
   if (!keyRecord || !keyRecord.isActive) {
     return null;
   }
 
+  // Best-effort usage timestamp: a failure here must not deny a valid key.
   try {
-    db.update(apiKeys)
+    await db
+      .update(apiKeys)
       .set({ lastUsedAt: Date.now() })
-      .where(eq(apiKeys.id, keyRecord.id))
-      .run();
+      .where(eq(apiKeys.id, keyRecord.id as string));
   } catch (e) {}
 
   return keyRecord;
@@ -215,35 +199,56 @@ export async function validateApiKey(
  * clients present that exact registered key.
  */
 export async function validateClientKey(
-  providedKey: string
+  providedKey: string,
 ): Promise<ClientKey | null> {
   if (!providedKey) return null;
-  const keyRecord = db
-    .select()
-    .from(clientKeys)
-    .where(eq(clientKeys.key, providedKey))
-    .get();
+  const keyRecord = (
+    await db
+      .select()
+      .from(clientKeys)
+      .where(eq(clientKeys.key, providedKey))
+      .limit(1)
+  )[0];
 
   if (!keyRecord || !keyRecord.isActive) {
     return null;
   }
 
-  // Update lastUsedAt asynchronously
+  // Best-effort usage timestamp: a failure here must not deny a valid key.
   try {
-    db.update(clientKeys)
+    await db
+      .update(clientKeys)
       .set({ lastUsedAt: Date.now() })
-      .where(eq(clientKeys.id, keyRecord.id))
-      .run();
+      .where(eq(clientKeys.id, keyRecord.id as string));
   } catch (e) {}
   return keyRecord;
 }
 
-export function incrementClientKeyTokens(clientKeyId: string, tokens: number): void {
+/**
+ * Adds `tokens` to a client key's running total.
+ *
+ * Expressed as a single `SET used_tokens = used_tokens + ?` rather than a
+ * read-modify-write. The quota check in the proxy compares a *snapshot* of
+ * `usedTokens` taken at request start, so a lost update here is not a cosmetic
+ * rounding error: on a pooled engine two concurrent requests would both read
+ * the same total and both write the same result, and the shortfall would let a
+ * key exceed its `tokenLimit` by the amount that went missing. With SQLite the
+ * single connection serialised these calls, which is why the read-then-write
+ * form was correct there and is not correct on Postgres or MySQL.
+ *
+ * Callers on the proxy path do not await this; a rejection is logged and
+ * swallowed, because losing a usage count must never fail the request being
+ * served.
+ */
+export async function incrementClientKeyTokens(
+  clientKeyId: string,
+  tokens: number,
+): Promise<void> {
   try {
-    sqlite.run(
-      "UPDATE client_keys SET used_tokens = used_tokens + ? WHERE id = ?",
-      [tokens, clientKeyId]
-    );
+    await db
+      .update(clientKeys)
+      .set({ usedTokens: sql`${clientKeys.usedTokens} + ${tokens}` })
+      .where(eq(clientKeys.id, clientKeyId));
   } catch (e) {
     console.error("Failed to increment key tokens:", e);
   }
@@ -252,12 +257,17 @@ export function incrementClientKeyTokens(clientKeyId: string, tokens: number): v
 // In-memory sliding rate limiter per minute
 const rateLimitMap = new Map<string, number[]>();
 
-export function checkClientRateLimit(keyId: string, maxPerMinute?: number | null): boolean {
+export function checkClientRateLimit(
+  keyId: string,
+  maxPerMinute?: number | null,
+): boolean {
   if (!maxPerMinute || maxPerMinute <= 0) return true;
   const now = Date.now();
   const windowStart = now - 60000;
 
-  const timestamps = (rateLimitMap.get(keyId) || []).filter((t) => t > windowStart);
+  const timestamps = (rateLimitMap.get(keyId) || []).filter(
+    (t) => t > windowStart,
+  );
   if (timestamps.length >= maxPerMinute) {
     return false;
   }

@@ -1,4 +1,4 @@
-import { db } from "../db";
+import { db, fetchAll, fetchOne, runStatement } from "../db";
 import { telemetryLogs, type TelemetryLog } from "../db/schema";
 import { desc, eq, sql } from "drizzle-orm";
 
@@ -19,10 +19,10 @@ export interface LogTelemetryParams {
   errorMessage?: string | null;
 }
 
-export function recordTelemetry(params: LogTelemetryParams): void {
+export async function recordTelemetry(params: LogTelemetryParams): Promise<void> {
   try {
     const id = "log_" + crypto.randomUUID().replace(/-/g, "");
-    db.insert(telemetryLogs)
+    await runStatement(db.insert(telemetryLogs)
       .values({
         id,
         clientKeyId: params.clientKeyId ?? null,
@@ -42,8 +42,7 @@ export function recordTelemetry(params: LogTelemetryParams): void {
         isStreaming: params.isStreaming ? 1 : 0,
         errorMessage: params.errorMessage ?? null,
         createdAt: Date.now(),
-      })
-      .run();
+      }));
   } catch (e) {
     console.error("Failed to record telemetry log:", e);
   }
@@ -260,7 +259,7 @@ export interface TelemetryStatsOptions {
   all?: boolean;
 }
 
-export function getTelemetryStats(
+export async function getTelemetryStats(
   params: number | TelemetryStatsOptions = 24 * 60 * 60 * 1000
 ) {
   let isAll = false;
@@ -293,7 +292,7 @@ export function getTelemetryStats(
     ? sql`${telemetryLogs.statusCode} >= 200 AND ${telemetryLogs.statusCode} < 300`
     : sql`${telemetryLogs.createdAt} >= ${since} AND ${telemetryLogs.statusCode} >= 200 AND ${telemetryLogs.statusCode} < 300`;
 
-  const totalReq = db
+  const totalReq = await fetchOne(db
     .select({
       count: sql<number>`count(*)`,
       promptTokens: sql<number>`coalesce(sum(${telemetryLogs.promptTokens}), 0)`,
@@ -303,17 +302,15 @@ export function getTelemetryStats(
       avgDuration: sql<number>`coalesce(avg(${telemetryLogs.durationMs}), 0)`,
     })
     .from(telemetryLogs)
-    .where(totalWhere)
-    .get();
+    .where(totalWhere));
 
-  const successCount = db
+  const successCount = (await fetchOne(db
     .select({ count: sql<number>`count(*)` })
     .from(telemetryLogs)
-    .where(successWhere)
-    .get()?.count || 0;
+    .where(successWhere)))?.count || 0;
 
   // Breakdown by model with prompt, completion, and cached tokens
-  const rawModelStats = db
+  const rawModelStats = await fetchAll(db
     .select({
       model: telemetryLogs.model,
       provider: telemetryLogs.provider,
@@ -325,8 +322,7 @@ export function getTelemetryStats(
     })
     .from(telemetryLogs)
     .where(totalWhere)
-    .groupBy(telemetryLogs.model, telemetryLogs.provider)
-    .all();
+    .groupBy(telemetryLogs.model, telemetryLogs.provider));
 
   let totalCost = 0;
   const modelStats = rawModelStats.map((ms) => {
@@ -372,12 +368,11 @@ export function getTelemetryStats(
   };
 }
 
-export function getRecentLogs(limit = 50, offset = 0) {
-  return db
+export async function getRecentLogs(limit = 50, offset = 0) {
+  return await fetchAll(db
     .select()
     .from(telemetryLogs)
     .orderBy(desc(telemetryLogs.createdAt))
     .limit(limit)
-    .offset(offset)
-    .all();
+    .offset(offset));
 }

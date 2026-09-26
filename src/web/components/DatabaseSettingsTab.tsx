@@ -17,16 +17,109 @@ import {
   Clock,
   Tags,
 } from "lucide-react";
-import { apiRequest, type SystemInfo, type OptimizationSettings } from "../lib/api";
+import {
+  apiRequest,
+  type SystemInfo,
+  type OptimizationSettings,
+} from "../lib/api";
 
-const formatBytes = (bytes?: number): string => {
-  if (!bytes || bytes <= 0) return "0 B";
+/**
+ * Formats a byte count, or explains why there is none. `null` is the API's
+ * answer for a database whose size it cannot see, which is every engine except
+ * file-backed SQLite — rendering that as "0 B" would claim an empty database
+ * rather than an unknown one.
+ */
+const formatBytes = (bytes?: number | null): string => {
+  if (bytes === null || bytes === undefined) return "not reported";
+  if (bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   const unitIndex = Math.min(Math.max(i, 0), units.length - 1);
   const val = bytes / Math.pow(1024, unitIndex);
   return `${parseFloat(val.toFixed(2))} ${units[unitIndex]}`;
 };
+
+/** Per-engine wording for the persistence card. The index matches `SystemInfo["database"]["dialect"]`. */
+const DIALECT_COPY = {
+  sqlite: {
+    name: "SQLite",
+    // What WAL actually buys, and that the export is a file copy.
+    detail: (
+      <>
+        Neko-Router runs on native{" "}
+        <code className="font-mono text-zinc-800 dark:text-zinc-200">
+          bun:sqlite
+        </code>{" "}
+        with Write-Ahead Logging (
+        <code className="font-mono text-zinc-800 dark:text-zinc-200">
+          PRAGMA journal_mode = WAL
+        </code>
+        ) for high concurrent throughput.
+      </>
+    ),
+    exportDetail: (
+      <>
+        Checkpoints WAL and downloads a full{" "}
+        <code className="font-mono">.sqlite</code> binary snapshot.
+      </>
+    ),
+    importDetail: (
+      <>
+        Upload an existing <code className="font-mono">.sqlite</code> file or a
+        JSON backup, with schema and integrity verification.
+      </>
+    ),
+    accept: ".sqlite,.db,.json",
+  },
+  postgresql: {
+    name: "PostgreSQL",
+    detail: (
+      <>
+        Neko-Router is connected to a PostgreSQL server over a pooled
+        connection. Exports are written as a JSON document covering every table,
+        since the server owns its own storage.
+      </>
+    ),
+    exportDetail: (
+      <>
+        Downloads a JSON document containing every table. The server&apos;s own
+        storage is unchanged.
+      </>
+    ),
+    importDetail: (
+      <>
+        Upload a JSON backup exported by Neko-Router. Replaces the contents of
+        every table it contains.
+      </>
+    ),
+    accept: ".json",
+  },
+  mysql: {
+    name: "MySQL",
+    detail: (
+      <>
+        Neko-Router is connected to a MySQL server over a pooled connection.
+        Exports are written as a JSON document covering every table, since the
+        server owns its own storage.
+      </>
+    ),
+    exportDetail: (
+      <>
+        Downloads a JSON document containing every table. The server&apos;s own
+        storage is unchanged.
+      </>
+    ),
+    importDetail: (
+      <>
+        Upload a JSON backup exported by Neko-Router. Replaces the contents of
+        every table it contains.
+      </>
+    ),
+    accept: ".json",
+  },
+} as const;
+
+type Dialect = keyof typeof DIALECT_COPY;
 
 const formatUptime = (totalSeconds?: number): string => {
   if (!totalSeconds || totalSeconds <= 0) return "0s";
@@ -48,6 +141,16 @@ export const DatabaseSettingsTab: React.FC = () => {
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(true);
 
+  /**
+   * The engine in use, taken from the server rather than inferred from the
+   * environment: the browser cannot see `DATABASE_URL`, and a build-time guess
+   * would be wrong the moment an operator pointed the same image at Postgres.
+   * Falls back to SQLite, which is the default deployment, until the first
+   * `/api/admin/system` response lands.
+   */
+  const dialect: Dialect = systemInfo?.database?.dialect ?? "sqlite";
+  const dialectCopy = DIALECT_COPY[dialect];
+
   // Global Optimizations state
   const [optimizations, setOptimizations] = useState<OptimizationSettings>({
     cacheEnabled: true,
@@ -66,17 +169,25 @@ export const DatabaseSettingsTab: React.FC = () => {
   const [currentPin, setCurrentPin] = useState("");
   const [newPin, setNewPin] = useState("");
   const [confirmPin, setConfirmPin] = useState("");
-  const [pinStatus, setPinStatus] = useState<{ success?: boolean; message?: string } | null>(null);
+  const [pinStatus, setPinStatus] = useState<{
+    success?: boolean;
+    message?: string;
+  } | null>(null);
   const [pinSubmitting, setPinSubmitting] = useState(false);
 
   // Import DB state
   const [importing, setImporting] = useState(false);
-  const [importStatus, setImportStatus] = useState<{ success?: boolean; message?: string } | null>(null);
+  const [importStatus, setImportStatus] = useState<{
+    success?: boolean;
+    message?: string;
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadOptimizations = async () => {
     try {
-      const data = await apiRequest<OptimizationSettings>("/api/admin/settings/optimizations");
+      const data = await apiRequest<OptimizationSettings>(
+        "/api/admin/settings/optimizations",
+      );
       setOptimizations(data);
     } catch (e) {
       console.error(e);
@@ -101,9 +212,12 @@ export const DatabaseSettingsTab: React.FC = () => {
 
   const handleClearCache = async () => {
     try {
-      const res = await apiRequest<{ cleared: number }>("/api/admin/cache/clear", {
-        method: "POST",
-      });
+      const res = await apiRequest<{ cleared: number }>(
+        "/api/admin/cache/clear",
+        {
+          method: "POST",
+        },
+      );
       setCacheClearStatus(`Purged ${res.cleared} cached responses`);
       setTimeout(() => setCacheClearStatus(null), 3000);
     } catch (e: any) {
@@ -134,11 +248,17 @@ export const DatabaseSettingsTab: React.FC = () => {
     setPinStatus(null);
 
     if (newPin.length !== 6) {
-      setPinStatus({ success: false, message: "New PIN must be exactly 6 digits" });
+      setPinStatus({
+        success: false,
+        message: "New PIN must be exactly 6 digits",
+      });
       return;
     }
     if (newPin !== confirmPin) {
-      setPinStatus({ success: false, message: "New PIN and confirmation do not match" });
+      setPinStatus({
+        success: false,
+        message: "New PIN and confirmation do not match",
+      });
       return;
     }
 
@@ -148,12 +268,18 @@ export const DatabaseSettingsTab: React.FC = () => {
         method: "POST",
         body: JSON.stringify({ currentPin, newPin }),
       });
-      setPinStatus({ success: true, message: "Master PIN successfully updated!" });
+      setPinStatus({
+        success: true,
+        message: "Master PIN successfully updated!",
+      });
       setCurrentPin("");
       setNewPin("");
       setConfirmPin("");
     } catch (err: any) {
-      setPinStatus({ success: false, message: err.message || "Failed to update PIN" });
+      setPinStatus({
+        success: false,
+        message: err.message || "Failed to update PIN",
+      });
     } finally {
       setPinSubmitting(false);
     }
@@ -163,11 +289,17 @@ export const DatabaseSettingsTab: React.FC = () => {
     window.location.href = "/api/admin/db/export";
   };
 
-  const handleImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportFileChange = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+  ) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!confirm("Warning: Importing a database will replace all current keys and logs. Make sure you have exported a backup first. Proceed?")) {
+    if (
+      !confirm(
+        "Warning: Importing a database will replace all current keys and logs. Make sure you have exported a backup first. Proceed?",
+      )
+    ) {
       if (fileInputRef.current) fileInputRef.current.value = "";
       return;
     }
@@ -192,7 +324,8 @@ export const DatabaseSettingsTab: React.FC = () => {
 
       setImportStatus({
         success: true,
-        message: "Database imported and verified successfully! Refreshing view...",
+        message:
+          "Database imported and verified successfully! Refreshing view...",
       });
 
       setTimeout(() => {
@@ -217,7 +350,8 @@ export const DatabaseSettingsTab: React.FC = () => {
           Global Router & System Settings
         </h2>
         <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          Configure global prompt compression, token caching engines, database backups, and security credentials.
+          Configure global prompt compression, token caching engines, database
+          backups, and security credentials.
         </p>
       </div>
 
@@ -236,7 +370,8 @@ export const DatabaseSettingsTab: React.FC = () => {
                 </span>
               </h3>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                Applied automatically to all inbound OpenAI and Anthropic proxy requests.
+                Applied automatically to all inbound OpenAI and Anthropic proxy
+                requests.
               </p>
             </div>
           </div>
@@ -269,32 +404,44 @@ export const DatabaseSettingsTab: React.FC = () => {
                 type="button"
                 role="switch"
                 aria-checked={optimizations.cacheEnabled}
-                onClick={() => updateOpt({ cacheEnabled: !optimizations.cacheEnabled })}
+                onClick={() =>
+                  updateOpt({ cacheEnabled: !optimizations.cacheEnabled })
+                }
                 className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
-                  optimizations.cacheEnabled ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]" : "bg-zinc-300 dark:bg-zinc-800"
+                  optimizations.cacheEnabled
+                    ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]"
+                    : "bg-zinc-300 dark:bg-zinc-800"
                 }`}
               >
                 <span
                   className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                    optimizations.cacheEnabled ? "translate-x-4" : "translate-x-0"
+                    optimizations.cacheEnabled
+                      ? "translate-x-4"
+                      : "translate-x-0"
                   }`}
                 />
               </button>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              Caches exact prompt completions in SQLite. Subsequent identical requests bypass upstream providers with instant 0ms TTFT.
+              Caches exact prompt completions in the database. Subsequent
+              identical requests bypass upstream providers with instant 0ms
+              TTFT.
             </p>
             {optimizations.cacheEnabled && (
               <div className="pt-2 border-t border-zinc-200/60 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-2 text-xs">
                 <div className="flex items-center space-x-1.5">
-                  <span className="text-[11px] text-zinc-500 dark:text-zinc-400">TTL:</span>
+                  <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                    TTL:
+                  </span>
                   <input
                     type="number"
                     min={60}
                     step={60}
                     value={optimizations.cacheTtlSeconds}
                     onChange={(e) =>
-                      updateOpt({ cacheTtlSeconds: parseInt(e.target.value, 10) || 3600 })
+                      updateOpt({
+                        cacheTtlSeconds: parseInt(e.target.value, 10) || 3600,
+                      })
                     }
                     className="w-20 px-2 py-1 rounded-md skeuo-inset text-zinc-900 dark:text-zinc-100 text-[11px] font-mono focus:outline-none"
                   />
@@ -328,20 +475,28 @@ export const DatabaseSettingsTab: React.FC = () => {
                 type="button"
                 role="switch"
                 aria-checked={optimizations.rtkCompression}
-                onClick={() => updateOpt({ rtkCompression: !optimizations.rtkCompression })}
+                onClick={() =>
+                  updateOpt({ rtkCompression: !optimizations.rtkCompression })
+                }
                 className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
-                  optimizations.rtkCompression ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]" : "bg-zinc-300 dark:bg-zinc-800"
+                  optimizations.rtkCompression
+                    ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]"
+                    : "bg-zinc-300 dark:bg-zinc-800"
                 }`}
               >
                 <span
                   className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                    optimizations.rtkCompression ? "translate-x-4" : "translate-x-0"
+                    optimizations.rtkCompression
+                      ? "translate-x-4"
+                      : "translate-x-0"
                   }`}
                 />
               </button>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              Repeated Token Knowledge pruning: strips identical duplicate lines, redundant sentences, and repetitive chat history bloat before forwarding upstream.
+              Repeated Token Knowledge pruning: strips identical duplicate
+              lines, redundant sentences, and repetitive chat history bloat
+              before forwarding upstream.
             </p>
           </div>
 
@@ -361,20 +516,28 @@ export const DatabaseSettingsTab: React.FC = () => {
                 type="button"
                 role="switch"
                 aria-checked={optimizations.cavemanMode}
-                onClick={() => updateOpt({ cavemanMode: !optimizations.cavemanMode })}
+                onClick={() =>
+                  updateOpt({ cavemanMode: !optimizations.cavemanMode })
+                }
                 className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
-                  optimizations.cavemanMode ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]" : "bg-zinc-300 dark:bg-zinc-800"
+                  optimizations.cavemanMode
+                    ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]"
+                    : "bg-zinc-300 dark:bg-zinc-800"
                 }`}
               >
                 <span
                   className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                    optimizations.cavemanMode ? "translate-x-4" : "translate-x-0"
+                    optimizations.cavemanMode
+                      ? "translate-x-4"
+                      : "translate-x-0"
                   }`}
                 />
               </button>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              Injects dense brevity instructions. Omit all pleasantries, greetings, apologies, and conversational fluff to slash output tokens.
+              Injects dense brevity instructions. Omit all pleasantries,
+              greetings, apologies, and conversational fluff to slash output
+              tokens.
             </p>
           </div>
 
@@ -394,57 +557,78 @@ export const DatabaseSettingsTab: React.FC = () => {
                 type="button"
                 role="switch"
                 aria-checked={optimizations.minifyPrompt}
-                onClick={() => updateOpt({ minifyPrompt: !optimizations.minifyPrompt })}
+                onClick={() =>
+                  updateOpt({ minifyPrompt: !optimizations.minifyPrompt })
+                }
                 className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
-                  optimizations.minifyPrompt ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]" : "bg-zinc-300 dark:bg-zinc-800"
+                  optimizations.minifyPrompt
+                    ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]"
+                    : "bg-zinc-300 dark:bg-zinc-800"
                 }`}
               >
                 <span
                   className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                    optimizations.minifyPrompt ? "translate-x-4" : "translate-x-0"
+                    optimizations.minifyPrompt
+                      ? "translate-x-4"
+                      : "translate-x-0"
                   }`}
                 />
               </button>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              Minifies prompt payloads by trimming trailing whitespace and collapsing consecutive line breaks before hitting the model tokenizers.
+              Minifies prompt payloads by trimming trailing whitespace and
+              collapsing consecutive line breaks before hitting the model
+              tokenizers.
             </p>
           </div>
 
-              {/* 5. Provider Model Prefix */}
-              <div className="skeuo-card-subtle p-4 rounded-md space-y-3 col-span-1 md:col-span-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center space-x-2">
-                    <Tags className="w-4 h-4 text-indigo-500" />
-                    <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
-                      Provider Model Prefix
-                    </span>
-                    <span className="text-[9px] px-1.5 py-0.2 rounded font-bold uppercase bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
-                      {optimizations.modelPrefixEnabled ? "Prefix Shown" : "Unified Names"}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={optimizations.modelPrefixEnabled}
-                    onClick={() => updateOpt({ modelPrefixEnabled: !optimizations.modelPrefixEnabled })}
-                    className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
-                      optimizations.modelPrefixEnabled ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]" : "bg-zinc-300 dark:bg-zinc-800"
-                    }`}
-                  >
-                    <span
-                      className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                        optimizations.modelPrefixEnabled ? "translate-x-4" : "translate-x-0"
-                      }`}
-                    />
-                  </button>
-                </div>
-                <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-                  When enabled, the /v1/models list shows each provider's prefix (e.g. <span className="font-mono">bb/glm-flash</span>). When disabled, prefixes are hidden and duplicate models from multiple providers collapse into a single unified entry.
-                </p>
+          {/* 5. Provider Model Prefix */}
+          <div className="skeuo-card-subtle p-4 rounded-md space-y-3 col-span-1 md:col-span-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <Tags className="w-4 h-4 text-indigo-500" />
+                <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                  Provider Model Prefix
+                </span>
+                <span className="text-[9px] px-1.5 py-0.2 rounded font-bold uppercase bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
+                  {optimizations.modelPrefixEnabled
+                    ? "Prefix Shown"
+                    : "Unified Names"}
+                </span>
               </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={optimizations.modelPrefixEnabled}
+                onClick={() =>
+                  updateOpt({
+                    modelPrefixEnabled: !optimizations.modelPrefixEnabled,
+                  })
+                }
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
+                  optimizations.modelPrefixEnabled
+                    ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]"
+                    : "bg-zinc-300 dark:bg-zinc-800"
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                    optimizations.modelPrefixEnabled
+                      ? "translate-x-4"
+                      : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </div>
+            <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+              When enabled, the /v1/models list shows each provider's prefix
+              (e.g. <span className="font-mono">bb/glm-flash</span>). When
+              disabled, prefixes are hidden and duplicate models from multiple
+              providers collapse into a single unified entry.
+            </p>
+          </div>
 
-              {/* 6. HTTPS-Only API Enforcement */}
+          {/* 6. HTTPS-Only API Enforcement */}
           <div className="skeuo-card-subtle p-4 rounded-md space-y-3 col-span-1 md:col-span-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2">
@@ -460,9 +644,13 @@ export const DatabaseSettingsTab: React.FC = () => {
                 type="button"
                 role="switch"
                 aria-checked={optimizations.httpsOnly}
-                onClick={() => updateOpt({ httpsOnly: !optimizations.httpsOnly })}
+                onClick={() =>
+                  updateOpt({ httpsOnly: !optimizations.httpsOnly })
+                }
                 className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-zinc-700/50 transition-colors duration-200 ease-in-out focus:outline-none ${
-                  optimizations.httpsOnly ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]" : "bg-zinc-300 dark:bg-zinc-800"
+                  optimizations.httpsOnly
+                    ? "bg-emerald-600 shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)]"
+                    : "bg-zinc-300 dark:bg-zinc-800"
                 }`}
               >
                 <span
@@ -473,11 +661,13 @@ export const DatabaseSettingsTab: React.FC = () => {
               </button>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              Rejects unencrypted HTTP requests to AI proxy endpoints (/v1/chat/completions, /v1/messages, /v1/models). Enforces TLS encryption via protocol check and X-Forwarded-Proto inspection.
+              Rejects unencrypted HTTP requests to AI proxy endpoints
+              (/v1/chat/completions, /v1/messages, /v1/models). Enforces TLS
+              encryption via protocol check and X-Forwarded-Proto inspection.
             </p>
           </div>
 
-              {/* 7. Request Timeout (API Duration Limit) */}
+          {/* 7. Request Timeout (API Duration Limit) */}
           <div className="skeuo-card-subtle p-4 rounded-md space-y-3 col-span-1 md:col-span-2">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center space-x-2">
@@ -501,7 +691,10 @@ export const DatabaseSettingsTab: React.FC = () => {
                     step={1}
                     value={optimizations.requestTimeoutSeconds ?? 0}
                     onChange={(e) => {
-                      const val = Math.max(0, parseInt(e.target.value || "0", 10));
+                      const val = Math.max(
+                        0,
+                        parseInt(e.target.value || "0", 10),
+                      );
                       updateOpt({ requestTimeoutSeconds: val });
                     }}
                     className="w-full px-2.5 py-1.5 text-xs font-mono rounded-md skeuo-inset text-zinc-900 dark:text-zinc-100 pr-6 focus:outline-none focus:ring-1 focus:ring-zinc-600"
@@ -516,7 +709,9 @@ export const DatabaseSettingsTab: React.FC = () => {
                     <button
                       key={preset}
                       type="button"
-                      onClick={() => updateOpt({ requestTimeoutSeconds: preset })}
+                      onClick={() =>
+                        updateOpt({ requestTimeoutSeconds: preset })
+                      }
                       className={`px-2 py-1 text-[10px] font-mono font-medium rounded transition-colors ${
                         (optimizations.requestTimeoutSeconds ?? 0) === preset
                           ? "bg-orange-500 text-white font-bold"
@@ -530,7 +725,10 @@ export const DatabaseSettingsTab: React.FC = () => {
               </div>
             </div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              Sets the maximum duration (in seconds) allowed for AI proxy requests before timing out with HTTP 504. Default is <code className="font-mono text-orange-500 font-semibold">0</code> (unlimited duration).
+              Sets the maximum duration (in seconds) allowed for AI proxy
+              requests before timing out with HTTP 504. Default is{" "}
+              <code className="font-mono text-orange-500 font-semibold">0</code>{" "}
+              (unlimited duration).
             </p>
           </div>
         </div>
@@ -542,13 +740,41 @@ export const DatabaseSettingsTab: React.FC = () => {
           <div className="flex items-center space-x-2 pb-2 border-b border-zinc-200 dark:border-zinc-800">
             <Database className="w-5 h-5 text-indigo-500" />
             <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              Database Persistence & WAL
+              Database Persistence
             </h3>
           </div>
 
           <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
-            Neko-Router runs on native <code className="font-mono text-zinc-800 dark:text-zinc-200">bun:sqlite</code> with Write-Ahead Logging (<code className="font-mono text-zinc-800 dark:text-zinc-200">PRAGMA journal_mode = WAL</code>) for high concurrent throughput.
+            {dialectCopy.detail}
           </p>
+
+          {systemInfo?.database && (
+            <div className="flex items-center justify-between gap-3 text-[11px] py-2 px-3 rounded-md bg-zinc-100/60 dark:bg-zinc-800/40">
+              <span className="text-zinc-500 dark:text-zinc-400 shrink-0">
+                Engine
+              </span>
+              <span className="flex items-center gap-2 min-w-0">
+                <span className="font-mono font-semibold text-zinc-900 dark:text-zinc-100">
+                  {dialectCopy.name}
+                </span>
+                <span
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono ${
+                    systemInfo.database.reachable
+                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                      : "bg-red-500/10 text-red-600 dark:text-red-400"
+                  }`}
+                >
+                  {systemInfo.database.reachable ? "connected" : "unreachable"}
+                </span>
+              </span>
+            </div>
+          )}
+
+          {systemInfo?.database && systemInfo.database.dialect !== "sqlite" && (
+            <p className="text-[11px] text-zinc-500 dark:text-zinc-400 font-mono break-all">
+              {systemInfo.database.description}
+            </p>
+          )}
 
           {importStatus && (
             <div
@@ -580,7 +806,7 @@ export const DatabaseSettingsTab: React.FC = () => {
                 <Download className="w-4 h-4 text-zinc-500 group-hover:text-zinc-900 dark:group-hover:text-zinc-100 transition-colors" />
               </div>
               <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                Checkpoints WAL and downloads a full <code className="font-mono">.sqlite</code> binary snapshot.
+                {dialectCopy.exportDetail}
               </p>
             </button>
 
@@ -589,7 +815,7 @@ export const DatabaseSettingsTab: React.FC = () => {
               <input
                 type="file"
                 ref={fileInputRef}
-                accept=".sqlite,.db"
+                accept={dialectCopy.accept}
                 onChange={handleImportFileChange}
                 className="hidden"
               />
@@ -605,7 +831,7 @@ export const DatabaseSettingsTab: React.FC = () => {
                   <Upload className="w-4 h-4 text-zinc-500 group-hover:text-zinc-900 dark:group-hover:text-zinc-100 transition-colors" />
                 </div>
                 <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                  Upload an existing database with schema and integrity verification.
+                  {dialectCopy.importDetail}
                 </p>
               </button>
             </div>
@@ -650,7 +876,9 @@ export const DatabaseSettingsTab: React.FC = () => {
                 pattern="[0-9]*"
                 maxLength={6}
                 value={currentPin}
-                onChange={(e) => setCurrentPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                onChange={(e) =>
+                  setCurrentPin(e.target.value.replace(/\D/g, "").slice(0, 6))
+                }
                 placeholder="Enter current 6-digit PIN"
                 className="w-full px-3 py-2 rounded-md skeuo-inset text-zinc-900 dark:text-zinc-100 font-mono tracking-widest focus:outline-none focus:ring-1 focus:ring-zinc-600"
               />
@@ -668,7 +896,9 @@ export const DatabaseSettingsTab: React.FC = () => {
                   pattern="[0-9]*"
                   maxLength={6}
                   value={newPin}
-                  onChange={(e) => setNewPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  onChange={(e) =>
+                    setNewPin(e.target.value.replace(/\D/g, "").slice(0, 6))
+                  }
                   placeholder="••••••"
                   className="w-full px-3 py-2 rounded-md skeuo-inset text-zinc-900 dark:text-zinc-100 font-mono tracking-widest focus:outline-none focus:ring-1 focus:ring-zinc-600"
                 />
@@ -685,7 +915,9 @@ export const DatabaseSettingsTab: React.FC = () => {
                   pattern="[0-9]*"
                   maxLength={6}
                   value={confirmPin}
-                  onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  onChange={(e) =>
+                    setConfirmPin(e.target.value.replace(/\D/g, "").slice(0, 6))
+                  }
                   placeholder="••••••"
                   className="w-full px-3 py-2 rounded-md skeuo-inset text-zinc-900 dark:text-zinc-100 font-mono tracking-widest focus:outline-none focus:ring-1 focus:ring-zinc-600"
                 />
@@ -717,29 +949,41 @@ export const DatabaseSettingsTab: React.FC = () => {
               className="skeuo-btn p-1.5 rounded-md"
               title="Refresh diagnostics"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${loadingInfo ? "animate-spin" : ""}`} />
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${loadingInfo ? "animate-spin" : ""}`}
+              />
             </button>
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
             <div className="skeuo-card-subtle p-3 rounded-md">
-              <span className="text-zinc-400 block text-[10px]">Bun Runtime</span>
+              <span className="text-zinc-400 block text-[10px]">
+                Bun Runtime
+              </span>
               <span className="font-mono font-bold text-zinc-900 dark:text-zinc-100">
                 v{systemInfo?.bunVersion || "..."}
               </span>
             </div>
 
             <div className="skeuo-card-subtle p-3 rounded-md">
-              <span className="text-zinc-400 block text-[10px]">Memory (RSS)</span>
+              <span className="text-zinc-400 block text-[10px]">
+                Memory (RSS)
+              </span>
               <span className="font-mono font-bold text-zinc-900 dark:text-zinc-100">
                 {systemInfo?.memory?.rssMb || 0} MB
               </span>
             </div>
 
             <div className="skeuo-card-subtle p-3 rounded-md">
-              <span className="text-zinc-400 block text-[10px]">Database Size</span>
+              <span className="text-zinc-400 block text-[10px]">
+                Database Size
+              </span>
               <span className="font-mono font-bold text-zinc-900 dark:text-zinc-100">
-                {systemInfo ? formatBytes(systemInfo.dbSizeBytes) : "..."}
+                {!systemInfo
+                  ? "..."
+                  : systemInfo.dbSizeBytes !== null
+                    ? formatBytes(systemInfo.dbSizeBytes)
+                    : `n/a (${dialectCopy.name})`}
               </span>
             </div>
 

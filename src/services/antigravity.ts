@@ -1,4 +1,4 @@
-import { db } from "../db";
+import { db, fetchOne, runStatement } from "../db";
 import { upstreamKeys } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { parseUpstreamKeyEntries, type UpstreamKeyEntry } from "./router";
@@ -296,7 +296,7 @@ export async function forceRefreshAntigravityToken(upstreamId: string, entry: Up
     const newExpiresAt = Date.now() + (refreshed.expiresIn || 3600) * 1000;
 
     // Update database entry
-    const upstream = db.select().from(upstreamKeys).where(eq(upstreamKeys.id, upstreamId)).get();
+    const upstream = await fetchOne(db.select().from(upstreamKeys).where(eq(upstreamKeys.id, upstreamId)));
     if (upstream) {
       const entries = parseUpstreamKeyEntries(upstream.apiKeys, upstream.apiKey);
       const target = entries.find((e) => e.id === entry.id || e.key === entry.key);
@@ -305,14 +305,13 @@ export async function forceRefreshAntigravityToken(upstreamId: string, entry: Up
         target.expiresAt = newExpiresAt;
 
         const firstActive = entries.find((e) => e.isActive);
-        db.update(upstreamKeys)
+        await runStatement(db.update(upstreamKeys)
           .set({
             apiKey: firstActive ? firstActive.key : entries[0]?.key || newAccessToken,
             apiKeys: JSON.stringify(entries),
             updatedAt: Date.now(),
           })
-          .where(eq(upstreamKeys.id, upstreamId))
-          .run();
+          .where(eq(upstreamKeys.id, upstreamId)));
       }
     }
 

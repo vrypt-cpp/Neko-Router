@@ -18,7 +18,7 @@ export const authRoutes = new Elysia({ prefix: "/api/auth" })
     })
   )
   .get("/status", async ({ cookie, jwt }) => {
-    const isDefault = isDefaultPin();
+    const isDefault = await isDefaultPin();
     let authenticated = false;
 
     const session = cookie?.session;
@@ -33,7 +33,7 @@ export const authRoutes = new Elysia({ prefix: "/api/auth" })
       }
     }
 
-    const { siteKey, enabled } = getTurnstileConfig();
+    const { siteKey, enabled } = await getTurnstileConfig();
 
     return {
       isDefaultPin: isDefault,
@@ -47,7 +47,7 @@ export const authRoutes = new Elysia({ prefix: "/api/auth" })
     async ({ body, cookie, jwt, set, headers }) => {
       const { pin, turnstileToken } = body;
 
-      const { enabled } = getTurnstileConfig();
+      const { enabled } = await getTurnstileConfig();
       if (enabled) {
         const clientIp =
           headers["cf-connecting-ip"] ||
@@ -89,7 +89,7 @@ export const authRoutes = new Elysia({ prefix: "/api/auth" })
       return {
         success: true,
         token,
-        isDefaultPin: isDefaultPin(),
+        isDefaultPin: await isDefaultPin(),
       };
     },
     {

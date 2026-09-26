@@ -1,15 +1,14 @@
 import { Elysia, t } from "elysia";
-import { db } from "../db";
+import { db, fetchAll, fetchOne, runStatement } from "../db";
 import { clientKeys, apiKeys, telemetryLogs, upstreamKeys } from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { eq, desc, sql } from "drizzle-orm";
 
-function getFollowUpstreamIds(): Set<string> {
-  const rows = db
+async function getFollowUpstreamIds(): Promise<Set<string>> {
+  const rows = await fetchAll(db
     .select({ id: upstreamKeys.id })
     .from(upstreamKeys)
-    .where(eq(upstreamKeys.followUpstream, 1))
-    .all();
+    .where(eq(upstreamKeys.followUpstream, 1)));
   const set = new Set(rows.map((r) => r.id));
   set.add("up_bandelbanget_follow");
   set.add("bb");
@@ -40,8 +39,8 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       return { error: "Unauthorized access to Secret Keys" };
     }
   })
-  .get("/", () => {
-    const list = db
+  .get("/", async () => {
+    const list = await fetchAll(db
       .select({
         id: clientKeys.id,
         apiKeyId: clientKeys.apiKeyId,
@@ -62,8 +61,7 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       })
       .from(clientKeys)
       .leftJoin(apiKeys, eq(clientKeys.apiKeyId, apiKeys.id))
-      .orderBy(desc(clientKeys.createdAt))
-      .all();
+      .orderBy(desc(clientKeys.createdAt)));
 
     return {
       keys: list.map((k) => {
@@ -92,13 +90,13 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
   })
   .post(
     "/",
-    ({ body, set }) => {
+    async ({ body, set }) => {
       const { name, apiKeyId, customKey, tokenLimit, rateLimit, allowedProviders, roundRobinProviders, isFollowUpstream } = body;
 
       const id = "ck_" + crypto.randomUUID().replace(/-/g, "");
       let keyStr: string;
 
-      const followIds = getFollowUpstreamIds();
+      const followIds = await getFollowUpstreamIds();
       let allowedArr = (Array.isArray(allowedProviders) ? allowedProviders : []).filter((p) => p !== "openai");
       const hasFollow = allowedArr.some((p) => followIds.has(p));
       const isFollow = Boolean(isFollowUpstream) || hasFollow;
@@ -117,7 +115,7 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
           keyStr = customKey.trim();
         } else {
           // Check if bb-default is taken, if so use bb-default-<id-slice>
-          const existingDefault = db.select().from(clientKeys).where(eq(clientKeys.key, "bb-default")).get();
+          const existingDefault = await fetchOne(db.select().from(clientKeys).where(eq(clientKeys.key, "bb-default")));
           keyStr = existingDefault ? `bb-default-${id.slice(3, 8)}` : "bb-default";
         }
       } else {
@@ -126,11 +124,10 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       }
 
       // Check duplicate
-      const existing = db
+      const existing = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.key, keyStr))
-        .get();
+        .where(eq(clientKeys.key, keyStr)));
 
       if (existing) {
         set.status = 400;
@@ -139,14 +136,14 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
 
       let assignedApiKeyId = apiKeyId;
       if (assignedApiKeyId) {
-        const parentKey = db.select().from(apiKeys).where(eq(apiKeys.id, assignedApiKeyId)).get();
+        const parentKey = await fetchOne(db.select().from(apiKeys).where(eq(apiKeys.id, assignedApiKeyId)));
         if (!parentKey) {
           set.status = 400;
           return { error: "Specified Router API Key not found" };
         }
       } else {
         // Assign to first existing API Key, or create default API Key if none exists
-        const firstApiKey = db.select().from(apiKeys).limit(1).get();
+        const firstApiKey = await fetchOne(db.select().from(apiKeys).limit(1));
         if (firstApiKey) {
           assignedApiKeyId = firstApiKey.id;
         } else {
@@ -155,7 +152,7 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
             .map((b) => b.toString(36))
             .join("")
             .slice(0, 24);
-          db.insert(apiKeys)
+          await runStatement(db.insert(apiKeys)
             .values({
               id: defaultId,
               name: "Default API Key",
@@ -164,15 +161,14 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
               isActive: 1,
               createdAt: Date.now(),
               lastUsedAt: null,
-            })
-            .run();
+            }));
           assignedApiKeyId = defaultId;
         }
       }
 
       const now = Date.now();
 
-      db.insert(clientKeys)
+      await runStatement(db.insert(clientKeys)
         .values({
           id,
           apiKeyId: assignedApiKeyId,
@@ -187,10 +183,9 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
           isFollowUpstream: isFollow ? 1 : 0,
           createdAt: now,
           lastUsedAt: null,
-        })
-        .run();
+        }));
 
-      const parentKeyRecord = db.select().from(apiKeys).where(eq(apiKeys.id, assignedApiKeyId)).get();
+      const parentKeyRecord = await fetchOne(db.select().from(apiKeys).where(eq(apiKeys.id, assignedApiKeyId)));
 
       return {
         success: true,
@@ -226,12 +221,11 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
   )
   .patch(
     "/:id",
-    ({ params: { id }, body, set }) => {
-      const existing = db
+    async ({ params: { id }, body, set }) => {
+      const existing = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.id, id))
-        .get();
+        .where(eq(clientKeys.id, id)));
 
       if (!existing) {
         set.status = 404;
@@ -242,7 +236,7 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       if (body.name !== undefined) updateData.name = body.name.trim();
       if (body.apiKeyId !== undefined) {
         if (body.apiKeyId) {
-          const parent = db.select().from(apiKeys).where(eq(apiKeys.id, body.apiKeyId)).get();
+          const parent = await fetchOne(db.select().from(apiKeys).where(eq(apiKeys.id, body.apiKeyId)));
           if (!parent) {
             set.status = 400;
             return { error: "Parent Router API Key not found" };
@@ -265,7 +259,7 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
         updateData.tokenLimit = newLimit > 0 ? Math.floor(newLimit) : null;
       }
       if (body.allowedProviders !== undefined) {
-        const followIds = getFollowUpstreamIds();
+        const followIds = await getFollowUpstreamIds();
         let arr = (Array.isArray(body.allowedProviders) ? body.allowedProviders : []).filter((p) => p !== "openai");
         const hasFollow = arr.some((p) => followIds.has(p));
         if (hasFollow) {
@@ -288,12 +282,11 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
         updateData.usedTokens = Math.max(0, Math.floor((existing.usedTokens || 0) + body.adjustTokens));
       }
 
-      db.update(clientKeys)
+      await runStatement(db.update(clientKeys)
         .set(updateData)
-        .where(eq(clientKeys.id, id))
-        .run();
+        .where(eq(clientKeys.id, id)));
 
-      const updated = db.select().from(clientKeys).where(eq(clientKeys.id, id)).get();
+      const updated = await fetchOne(db.select().from(clientKeys).where(eq(clientKeys.id, id)));
 
       return { success: true, key: updated };
     },
@@ -315,12 +308,11 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
   )
   .post(
     "/:id/rotate",
-    ({ params: { id }, body, set }) => {
-      const existing = db
+    async ({ params: { id }, body, set }) => {
+      const existing = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.id, id))
-        .get();
+        .where(eq(clientKeys.id, id)));
 
       if (!existing) {
         set.status = 404;
@@ -330,21 +322,19 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       const customKey = body?.customKey;
       const newKeyStr = generateKeyString(customKey);
 
-      const duplicate = db
+      const duplicate = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.key, newKeyStr))
-        .get();
+        .where(eq(clientKeys.key, newKeyStr)));
 
       if (duplicate && duplicate.id !== id) {
         set.status = 400;
         return { error: "API Key string already exists" };
       }
 
-      db.update(clientKeys)
+      await runStatement(db.update(clientKeys)
         .set({ key: newKeyStr })
-        .where(eq(clientKeys.id, id))
-        .run();
+        .where(eq(clientKeys.id, id)));
 
       const displayKey =
         newKeyStr.length > 14
@@ -368,12 +358,11 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
   )
   .post(
     "/:id/regenerate",
-    ({ params: { id }, body, set }) => {
-      const existing = db
+    async ({ params: { id }, body, set }) => {
+      const existing = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.id, id))
-        .get();
+        .where(eq(clientKeys.id, id)));
 
       if (!existing) {
         set.status = 404;
@@ -383,21 +372,19 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       const customKey = body?.customKey;
       const newKeyStr = generateKeyString(customKey);
 
-      const duplicate = db
+      const duplicate = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.key, newKeyStr))
-        .get();
+        .where(eq(clientKeys.key, newKeyStr)));
 
       if (duplicate && duplicate.id !== id) {
         set.status = 400;
         return { error: "API Key string already exists" };
       }
 
-      db.update(clientKeys)
+      await runStatement(db.update(clientKeys)
         .set({ key: newKeyStr })
-        .where(eq(clientKeys.id, id))
-        .run();
+        .where(eq(clientKeys.id, id)));
 
       const displayKey =
         newKeyStr.length > 14
@@ -421,12 +408,11 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
   )
   .post(
     "/:id/adjust-quota",
-    ({ params: { id }, body, set }) => {
-      const existing = db
+    async ({ params: { id }, body, set }) => {
+      const existing = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.id, id))
-        .get();
+        .where(eq(clientKeys.id, id)));
 
       if (!existing) {
         set.status = 404;
@@ -465,12 +451,11 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
             : null;
       }
 
-      db.update(clientKeys)
+      await runStatement(db.update(clientKeys)
         .set(updateData)
-        .where(eq(clientKeys.id, id))
-        .run();
+        .where(eq(clientKeys.id, id)));
 
-      const updated = db.select().from(clientKeys).where(eq(clientKeys.id, id)).get();
+      const updated = await fetchOne(db.select().from(clientKeys).where(eq(clientKeys.id, id)));
 
       return {
         success: true,
@@ -489,40 +474,37 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       }),
     }
   )
-  .post("/:id/reset-quota", ({ params: { id }, set }) => {
-    const existing = db
+  .post("/:id/reset-quota", async ({ params: { id }, set }) => {
+    const existing = await fetchOne(db
       .select()
       .from(clientKeys)
-      .where(eq(clientKeys.id, id))
-      .get();
+      .where(eq(clientKeys.id, id)));
 
     if (!existing) {
       set.status = 404;
       return { error: "Key not found" };
     }
 
-    db.update(clientKeys)
+    await runStatement(db.update(clientKeys)
       .set({ usedTokens: 0 })
-      .where(eq(clientKeys.id, id))
-      .run();
+      .where(eq(clientKeys.id, id)));
 
     return { success: true, message: "Token quota usage reset to 0" };
   })
   .post(
     "/:id/toggle-provider",
-    ({ params: { id }, body, set }) => {
-      const existing = db
+    async ({ params: { id }, body, set }) => {
+      const existing = await fetchOne(db
         .select()
         .from(clientKeys)
-        .where(eq(clientKeys.id, id))
-        .get();
+        .where(eq(clientKeys.id, id)));
 
       if (!existing) {
         set.status = 404;
         return { success: false, error: "Key not found" };
       }
 
-      const followIds = getFollowUpstreamIds();
+      const followIds = await getFollowUpstreamIds();
       let currentAllowed: string[] = [];
       try {
         if (existing.allowedProviders) currentAllowed = JSON.parse(existing.allowedProviders);
@@ -550,13 +532,12 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
 
       const hasFollow = updatedAllowed.some((p) => followIds.has(p));
 
-      db.update(clientKeys)
+      await runStatement(db.update(clientKeys)
         .set({
           allowedProviders: JSON.stringify(updatedAllowed),
           isFollowUpstream: hasFollow ? 1 : 0,
         })
-        .where(eq(clientKeys.id, id))
-        .run();
+        .where(eq(clientKeys.id, id)));
 
       return {
         success: true,
@@ -572,14 +553,14 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
   )
   .post(
     "/batch-delete",
-    ({ body, set }) => {
+    async ({ body, set }) => {
       const { ids } = body;
       if (!Array.isArray(ids) || ids.length === 0) {
         set.status = 400;
         return { error: "No key IDs provided" };
       }
       for (const id of ids) {
-        db.delete(clientKeys).where(eq(clientKeys.id, id)).run();
+        await runStatement(db.delete(clientKeys).where(eq(clientKeys.id, id)));
       }
       return { success: true, deletedCount: ids.length };
     },
@@ -589,18 +570,17 @@ export const keysRoutes = new Elysia({ prefix: "/api/keys" })
       }),
     }
   )
-  .delete("/:id", ({ params: { id }, set }) => {
-    const existing = db
+  .delete("/:id", async ({ params: { id }, set }) => {
+    const existing = await fetchOne(db
       .select()
       .from(clientKeys)
-      .where(eq(clientKeys.id, id))
-      .get();
+      .where(eq(clientKeys.id, id)));
 
     if (!existing) {
       set.status = 404;
       return { error: "Key not found" };
     }
 
-    db.delete(clientKeys).where(eq(clientKeys.id, id)).run();
+    await runStatement(db.delete(clientKeys).where(eq(clientKeys.id, id)));
     return { success: true };
   });
