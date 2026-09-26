@@ -182,6 +182,57 @@ export function isTlsRequiredError(error: unknown): boolean {
   );
 }
 
+/**
+ * Removes the `sslmode` parameter from a connection string, leaving everything
+ * else byte-for-byte identical.
+ *
+ * This exists because of how `pg` assembles its configuration:
+ *
+ *   config = Object.assign({}, config, parse(config.connectionString))
+ *
+ * The caller's options are applied *first* and the parsed connection string is
+ * applied *second*, so anything the URL mentions wins. And `pg-connection-string`
+ * contains:
+ *
+ *   if (config.sslcert || config.sslkey || config.sslrootcert || config.sslmode) {
+ *     config.ssl = {}
+ *   }
+ *
+ * That last line means any URL carrying `sslmode` discards the `ssl` option
+ * this driver passes in and replaces it with an empty object, whose
+ * `rejectUnauthorized` defaults to true. Worse, pg 8 treats `require` as an
+ * alias for `verify-full` — a deliberate deviation from libpq, flagged by its
+ * own startup warning — so a URL that means "encrypt, do not verify" in every
+ * other Postgres tool arrives here meaning "encrypt and verify the
+ * certificate", and a managed provider's self-signed chain is rejected.
+ *
+ * Dropping the parameter lets this driver's own translation stand, which
+ * restores libpq semantics for `require` while keeping `verify-full`
+ * verifiable.
+ *
+ * Only the query string is touched. The authority is copied verbatim rather
+ * than round-tripped through `new URL()`, because that would re-encode the
+ * password and could corrupt credentials containing `@`, `/` or `%`.
+ *
+ * `sslrootcert`, `sslcert` and `sslkey` are deliberately left in place: pg reads
+ * them, and their presence is what upgrades the connection to full verification.
+ */
+export function withoutSslModeParam(connectionString: string): string {
+  const questionMark = connectionString.indexOf("?");
+  if (questionMark === -1) return connectionString;
+  // A unix-socket or keyword/value connection string is not a URL, and whatever
+  // follows its `?` means something else entirely; leave it alone.
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(connectionString))
+    return connectionString;
+
+  const base = connectionString.slice(0, questionMark);
+  const params = connectionString
+    .slice(questionMark + 1)
+    .split("&")
+    .filter((param) => !/^sslmode=/i.test(param));
+  return params.length > 0 ? `${base}?${params.join("&")}` : base;
+}
+
 export class PostgresDriver implements DbDriver {
   readonly dialect = "postgresql" as const;
 
@@ -195,15 +246,25 @@ export class PostgresDriver implements DbDriver {
     connectionString: string,
     options: { max?: number; ssl?: boolean | object } = {},
   ) {
+    // `pg` does not translate `sslmode` from the connection string, so the mode
+    // is resolved here and the parameter is then removed: left in place it would
+    // make pg-connection-string overwrite the `ssl` option below with `{}`, which
+    // discards `rejectUnauthorized` and silently upgrades `require` to
+    // `verify-full`. Leaving it unset when the URL is silent keeps `PGSSLMODE`
+    // working; forcing TLS on instead would break the ordinary self-hosted case
+    // (`postgres://user:pass@host:5432/db` against a container with no TLS), and
+    // the symptom of getting that wrong is a connection that cannot be made at
+    // all.
+    const ssl = options.ssl ?? sslFromConnectionString(connectionString);
+    const effectiveUrl =
+      ssl === undefined
+        ? connectionString
+        : withoutSslModeParam(connectionString);
+
     this.pool = new pg.Pool({
-      connectionString,
+      connectionString: effectiveUrl,
       max: options.max ?? 10,
-      // `pg` does not translate `sslmode` from the connection string, so the
-      // mode is resolved here. Leaving it `undefined` when the URL is silent
-      // keeps `PGSSLMODE` working; forcing TLS on instead would break the
-      // ordinary self-hosted case (`postgres://user:pass@host:5432/db` against
-      // a container with no TLS configured), which is the common deployment.
-      ssl: options.ssl ?? sslFromConnectionString(connectionString),
+      ssl,
     });
 
     // A pool that cannot connect reports the failure on every queued request,
